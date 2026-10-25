@@ -206,6 +206,7 @@ internal sealed unsafe partial class CExportGenerator(ICExportGeneratorOptions o
             }
         }
 
+        BuildMembers();
         EmitHandles();
     }
 
@@ -219,18 +220,20 @@ internal sealed unsafe partial class CExportGenerator(ICExportGeneratorOptions o
         MappedType returnType = MapType(clang.getCursorResultType(function), TypePosition.Return);
 
         List<string> parameters = [];
+        List<ParameterModel> models = [];
         int count = clang.Cursor_getNumArguments(function);
         for (int i = 0; i < count; i++)
         {
             CXCursor argument = clang.Cursor_getArgument(function, (uint)i);
             MappedType parameter = MapType(clang.getCursorType(argument), TypePosition.Parameter);
             string parameterName = clang.getCursorSpelling(argument).ToString();
-            parameters.Add(
-                $"{parameter.Attribute}{parameter.Modifier}{parameter.Type} "
-                + (parameterName.Length is 0 ? $"arg{i}" : Identifier(parameterName)));
+            string csName = parameterName.Length is 0 ? $"arg{i}" : Identifier(parameterName);
+            models.Add(new(csName, parameter));
+            parameters.Add($"{parameter.Attribute}{parameter.Modifier}{parameter.Type} {csName}");
         }
 
         _currentFunction = "";
+        _models.Add(new(name, returnType, models));
 
         using StringWriter source = new()
         {

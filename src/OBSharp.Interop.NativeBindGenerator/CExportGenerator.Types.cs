@@ -289,8 +289,10 @@ internal sealed unsafe partial class CExportGenerator
         uint key = KeyOf(declaration);
         if (!_handleNames.TryGetValue(key, out string? name))
         {
-            name = DeclarationName(declaration) + "Handle";
+            string cName = DeclarationName(declaration);
+            name = Pascal(cName);
             _handleNames[key] = name;
+            _owners[name] = (cName, true);
         }
 
         return name;
@@ -411,6 +413,7 @@ internal sealed unsafe partial class CExportGenerator
 
         string name = DeclarationName(declaration);
         _recordNames[key] = name;
+        _owners[name + "*"] = (name, false);
         try
         {
             _typeSources[name] = RecordSource(definition, name);
