@@ -9,4 +9,5 @@
     <File Path="LICENSE" />
     <File Path="nuget.config" />
   </Folder>
+  <Project Path="src/OBSharp.Interop.NativeBindGenerator/OBSharp.Interop.NativeBindGenerator.csproj" />
 </Solution>

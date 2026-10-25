@@ -1,0 +1,13 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="ClangSharp" />
+    <PackageReference Include="DotMake.CommandLine" />
+    <PackageReference Include="Humanizer.Core" />
+  </ItemGroup>
+
+</Project>

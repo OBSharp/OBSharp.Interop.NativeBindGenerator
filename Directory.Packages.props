@@ -2,7 +2,13 @@
   <PropertyGroup>
     <!-- Enable central package management, https://learn.microsoft.com/en-us/nuget/consume-packages/Central-Package-Management -->
     <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
   </PropertyGroup>
   <ItemGroup>
+  </ItemGroup>
+  <ItemGroup>
+    <PackageVersion Include="ClangSharp" Version="21.1.8.4" />
+    <PackageVersion Include="DotMake.CommandLine" Version="3.7.0" />
+    <PackageVersion Include="Humanizer.Core" Version="3.0.10" />
   </ItemGroup>
 </Project>

@@ -1,0 +1,55 @@
+{
+  "version": 2,
+  "dependencies": {
+    "net11.0": {
+      "ClangSharp": {
+        "type": "Direct",
+        "requested": "[21.1.8.4, )",
+        "resolved": "21.1.8.4",
+        "contentHash": "mAy085Giu/OLyAFFW+BZc/R4xX+/dB6QUHHS38/HvdKt+gunqdWzyy9IwvbHNDjeDcRT+WsB8D1XC8pm45aHAA==",
+        "dependencies": {
+          "ClangSharp.Interop": "21.1.8.4"
+        }
+      },
+      "DotMake.CommandLine": {
+        "type": "Direct",
+        "requested": "[3.7.0, )",
+        "resolved": "3.7.0",
+        "contentHash": "t7DvPCfFPd8Hz5Xk7zopOj7kG7ubRkQc2U47fiI3/SCircEDKBoyQBzoqrUokyl0KpU66u9ri486iG1s1sc/oA==",
+        "dependencies": {
+          "System.CommandLine": "[2.0.11, 3.0.0)"
+        }
+      },
+      "Humanizer.Core": {
+        "type": "Direct",
+        "requested": "[3.0.10, )",
+        "resolved": "3.0.10",
+        "contentHash": "yZIhtw8sYuvsONzQbZxWpR60tMWYHXoo0DL6nyOqSFiU5POjBTSEyWFpTQtJEZuy+oqiYTXKXY/Mjx7KnqIQFw=="
+      },
+      "ClangSharp.Interop": {
+        "type": "Transitive",
+        "resolved": "21.1.8.4",
+        "contentHash": "EPRNDWJ7BDxMAI/cZkJ2CvqzgDjr+dtOmYf+v81z0yOUOCWszvslVTetSQzvcgr6leJ7oCDLqn7QDPTar9Ui/g==",
+        "dependencies": {
+          "libClang": "21.1.8",
+          "libClangSharp": "21.1.8.2"
+        }
+      },
+      "libclang": {
+        "type": "Transitive",
+        "resolved": "21.1.8",
+        "contentHash": "dxAwUIutPYoFubhIBT/jbXbbvyQIggs8RusBBC6BAO2r08I2K6UcCVDTA/g5+Cpwp/FHJFBH0tpPH2rFV+gOsQ=="
+      },
+      "libClangSharp": {
+        "type": "Transitive",
+        "resolved": "21.1.8.2",
+        "contentHash": "Hh9ZESdTYDZTYvuIStJhgNW3C445TN4GWKRHSHznuo4eZ1g2zFrQiqcMO4pPkg6zKEI/c9lnsfQY6V26H29gGA=="
+      },
+      "System.CommandLine": {
+        "type": "Transitive",
+        "resolved": "2.0.11",
+        "contentHash": "Pmg3/T0M37ZS3ovwPHtfBNTCdqNpnxo+tnZMg8JDHVR0qD8KwcPUKlheEiZysb1En8IyH7yDoa9QDq97Ny/vhQ=="
+      }
+    }
+  }
+}
