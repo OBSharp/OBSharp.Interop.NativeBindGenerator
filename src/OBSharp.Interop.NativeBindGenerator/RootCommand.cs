@@ -38,6 +38,9 @@ public class RootCommand : ICExportGeneratorOptions
     [CliOption(Description = "把 --header 中的 C++ 类自动转发为 C 式导出（生成 native 代码），再据此生成 C# 绑定")]
     public bool CppRedirect { get; set; }
 
+    [CliOption(Description = "对 Qt 做特殊处理（需配合 --cpp-redirect）：信号转为 connect 导出、QObject 用 deleteLater 释放、QString 转 UTF-8")]
+    public bool Qt { get; set; }
+
     [CliOption(Description = "--cpp-redirect 的 native 产物目录")]
     public string NativeOutput { get; set; } = "generated/native";
 
@@ -58,6 +61,9 @@ public class RootCommand : ICExportGeneratorOptions
             Console.Error.WriteLine("必须通过 --header 至少指定一个头文件");
             return 1;
         }
+
+        if (Qt && !CppRedirect)
+            Console.Error.WriteLine("警告：--qt 仅在 --cpp-redirect 下生效，已忽略");
 
         try
         {

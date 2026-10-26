@@ -1,4 +1,5 @@
 using System.Text;
+using System.Text.RegularExpressions;
 
 using ClangSharp.Interop;
 
@@ -37,6 +38,7 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
     private readonly HashSet<string> _cNames = [];
     private readonly List<string> _headerDeclarations = [];
     private readonly List<string> _sourceDefinitions = [];
+    private readonly List<string> _sourceTypedefs = [];
     private HashSet<string> _headers = [];
     private string _headerText = "";
 
@@ -79,6 +81,9 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
                         if (_sourceDefinitions.Count > before)
                             _usedClasses.Add(Usr(info.Cursor));
                     }
+
+                    if (_connectionUsed)
+                        BindConnectionDestroy();
 
                     // 头文件文本依赖仍存活的游标，必须在翻译单元释放之前生成
                     _headerText = BuildHeader();
@@ -345,6 +350,12 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
                         $"static_cast<{qualifier}{info.CppName}*>({name})");
                 }
 
+                if (IsForeignQObject(pointeeCanonical))
+                {
+                    return new([new($"{qualifier}void*", $"{qualifier}void*", name)],
+                        $"static_cast<{qualifier}{QObjectSpelling(pointeeCanonical)}*>({name})");
+                }
+
                 throw new NotSupportedException($"不支持的指针参数 {clang.getTypeSpelling(type)}");
             }
 
@@ -355,6 +366,9 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
 
     private ParamPlan ConvertValue(CXType canonical, string name)
     {
+        if (options.Qt && IsQString(canonical))
+            return new([new("const char*", "const char*", name)], $"QString::fromUtf8({name})");
+
         if (IsStdStringView(canonical))
             return new([new("const char*", "const char*", name)], $"cppm::from_c_view({name})");
 
@@ -428,9 +442,15 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
                     return new("void*", "void*", x => $"cppm::ptr_to_void({x})");
                 }
 
+                if (IsForeignQObject(pointeeCanonical))
+                    return new("void*", "void*", x => $"cppm::ptr_to_void({x})");
+
                 throw new NotSupportedException($"不支持的指针返回值 {clang.getTypeSpelling(type)}");
             }
         }
+
+        if (options.Qt && IsQString(canonical))
+            return new("const char*", "char*", x => $"cppm::dup_string(({x}).toUtf8().constData())");
 
         if (IsStdString(canonical)
             || IsStdStringView(canonical))
@@ -528,7 +548,9 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
                 $"cppm::make_default<{selfType}>()"));
         }
 
-        foreach (CXCursor child in children.Where(c => clang.getCursorKind(c) is CXCursorKind.CXCursor_FieldDecl && IsPublic(c)))
+        foreach (CXCursor child in children.Where(c => clang.getCursorKind(c) is CXCursorKind.CXCursor_FieldDecl
+            && IsPublic(c)
+            && !(options.Qt && Spelling(c) is "staticMetaObject")))
         {
             string fieldName = Spelling(child);
             string snake = fieldName.Underscore();
@@ -539,7 +561,7 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
         }
 
         HashSet<string> seen = [];
-        foreach (CXCursor method in PublicMethods(cursor))
+        foreach ((CXCursor method, bool isSignal) in PublicMethods(cursor))
         {
             string name = Spelling(method);
             string key = name + "(" + string.Join(",", Enumerable.Range(0, clang.Cursor_getNumArguments(method))
@@ -548,38 +570,51 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
             if (!seen.Add(key))
                 continue;
 
-            TryBind(info, name.Underscore(), () => BindMethod(info, method, name));
+            if (isSignal)
+                TryBind(info, "信号 " + name, () => BindSignal(info, method, name));
+            else
+                TryBind(info, name.Underscore(), () => BindMethod(info, method, name));
         }
 
         if (destructorExported)
         {
+            // QObject 可能正在事件循环中使用，必须延迟销毁
+            string release = options.Qt && IsQObject(cursor)
+                ? $"static_cast<{selfType}*>({SelfName})->deleteLater()"
+                : $"delete static_cast<{selfType}*>({SelfName})";
             TryBind(info, "destroy", () => Add(
                 UniqueName(info.CName + "_destroy"),
                 new("void", "void", x => x),
                 [new(info.CName + "*", "void*", SelfName)],
-                $"delete static_cast<{selfType}*>({SelfName})",
+                release,
                 isStatement: true));
         }
     }
 
-    private IEnumerable<CXCursor> PublicMethods(CXCursor classCursor)
+    private IEnumerable<(CXCursor Method, bool IsSignal)> PublicMethods(CXCursor classCursor)
     {
+        bool inSignals = false;
         foreach (CXCursor child in CExportGenerator.ChildrenOf(classCursor))
         {
             switch (clang.getCursorKind(child))
             {
+                case CXCursorKind.CXCursor_CXXAccessSpecifier when options.Qt:
+                    inSignals = IsSignalsSpecifier(child);
+                    break;
+
                 case CXCursorKind.CXCursor_CXXMethod
                     when IsPublic(child)
                         && clang.CXXMethod_isDeleted(child) is 0
-                        && !Spelling(child).StartsWith("operator"):
-                    yield return child;
+                        && !Spelling(child).StartsWith("operator")
+                        && !(options.Qt && QtMetaMethods.Contains(Spelling(child))):
+                    yield return (child, inSignals);
                     break;
 
                 case CXCursorKind.CXCursor_CXXBaseSpecifier when IsPublic(child):
                     CXCursor baseDeclaration = clang.getTypeDeclaration(clang.getCursorType(child));
                     if (_classes.ContainsKey(Usr(baseDeclaration)))
                     {
-                        foreach (CXCursor inherited in PublicMethods(baseDeclaration))
+                        foreach (var inherited in PublicMethods(baseDeclaration))
                             yield return inherited;
                     }
 
@@ -587,6 +622,198 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
             }
         }
     }
+
+    // ---- Qt ----
+
+    // Q_OBJECT 宏注入的元对象成员，不应导出
+    private static readonly HashSet<string> QtMetaMethods =
+    [
+        "metaObject", "qt_metacast", "qt_metacall", "tr", "trUtf8", "qt_check_for_QGADGET_macro",
+    ];
+
+    private static readonly Regex SignalsBlockRegex =
+        new(@"^\s*(Q_SIGNALS|signals)\s*:", RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
+    private readonly Dictionary<string, string[]> _sourceLines = [];
+    private bool _connectionUsed;
+
+    private static bool IsQString(CXType canonical)
+        => clang.getTypeSpelling(canonical).ToString().Replace("const ", "").Trim() is "QString";
+
+    // 未被发现（不在 --header 中）的 QObject 派生类，如 QObject 本身，按不透明指针传递
+    private bool IsForeignQObject(CXType canonical)
+        => options.Qt
+            && canonical.kind is CXTypeKind.CXType_Record
+            && ClassOf(canonical) is null
+            && IsQObject(clang.getTypeDeclaration(canonical));
+
+    private static string QObjectSpelling(CXType canonical)
+        => clang.getTypeSpelling(canonical).ToString().Replace("const ", "").Trim();
+
+    private static bool IsQObject(CXCursor classCursor)
+    {
+        if (Spelling(classCursor) is "QObject")
+            return true;
+
+        foreach (CXCursor child in CExportGenerator.ChildrenOf(classCursor))
+        {
+            if (clang.getCursorKind(child) is CXCursorKind.CXCursor_CXXBaseSpecifier
+                && IsQObject(clang.getTypeDeclaration(clang.getCursorType(child))))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // 访问说明符带 qt_signal 注解（需要用户通过 -DQT_ANNOTATE_ACCESS_SPECIFIER 传入），
+    // 或其源码行是 signals: / Q_SIGNALS:
+    private bool IsSignalsSpecifier(CXCursor specifier)
+    {
+        if (CExportGenerator.ChildrenOf(specifier).Any(child =>
+            clang.getCursorKind(child) is CXCursorKind.CXCursor_AnnotateAttr
+            && Spelling(child) is "qt_signal"))
+        {
+            return true;
+        }
+
+        clang.getCursorLocation(specifier).GetExpansionLocation(out CXFile file, out uint line, out _, out _);
+        string path = clang.getFileName(file).ToString();
+        if (path.Length is 0)
+            return false;
+
+        if (!_sourceLines.TryGetValue(path, out string[]? lines))
+        {
+            lines = File.Exists(path) ? File.ReadAllLines(path) : [];
+            _sourceLines[path] = lines;
+        }
+
+        return line > 0
+            && line <= lines.Length
+            && SignalsBlockRegex.IsMatch(lines[line - 1]);
+    }
+
+    // 回调参数只在调用期间有效，字符串以借用指针传出
+    private (string H, string C, string Expression) ConvertCallbackArgument(CXType type, string name)
+    {
+        CXType canonical = clang.getCanonicalType(type);
+        if (canonical.kind is CXTypeKind.CXType_RValueReference)
+            throw new NotSupportedException("不支持右值引用信号参数");
+
+        if (canonical.kind is CXTypeKind.CXType_LValueReference)
+        {
+            CXType pointee = clang.getPointeeType(canonical);
+            if (clang.isConstQualifiedType(pointee) is 0
+                && ClassOf(clang.getCanonicalType(pointee)) is null)
+            {
+                throw new NotSupportedException($"不支持的非 const 引用信号参数 {clang.getTypeSpelling(type)}");
+            }
+
+            canonical = clang.getCanonicalType(pointee);
+            if (ClassOf(canonical) is { } referenced)
+            {
+                _usedClasses.Add(Usr(referenced.Cursor));
+                return (referenced.CName + "*", "void*", $"cppm::ref_to_void(const_cast<{referenced.CppName}&>({name}))");
+            }
+        }
+
+        if (IsQString(canonical))
+            return ("const char*", "const char*", $"{name}.toUtf8().constData()");
+
+        if (IsStdString(canonical)
+            || IsStdStringView(canonical))
+        {
+            return ("const char*", "const char*", $"std::string({name}).c_str()");
+        }
+
+        if (canonical.kind is CXTypeKind.CXType_Pointer)
+        {
+            CXType pointee = clang.getPointeeType(canonical);
+            CXType pointeeCanonical = clang.getCanonicalType(pointee);
+            string qualifier = clang.isConstQualifiedType(pointee) is not 0 ? "const " : "";
+            if (pointeeCanonical.kind is CXTypeKind.CXType_Void)
+                return ($"{qualifier}void*", $"{qualifier}void*", name);
+
+            if (ArithName(pointee) is { } arith)
+                return ($"{qualifier}{arith}*", $"{qualifier}{arith}*", name);
+
+            if (ClassOf(pointeeCanonical) is { } pointed)
+            {
+                _usedClasses.Add(Usr(pointed.Cursor));
+                return (pointed.CName + "*", "void*", $"cppm::ptr_to_void(const_cast<{pointed.CppName}*>({name}))");
+            }
+
+            if (IsForeignQObject(pointeeCanonical))
+                return ("void*", "void*", $"cppm::ptr_to_void(const_cast<{QObjectSpelling(pointeeCanonical)}*>({name}))");
+
+            throw new NotSupportedException($"不支持的指针信号参数 {clang.getTypeSpelling(type)}");
+        }
+
+        if (EnumOf(canonical) is { } enumInfo)
+            return (enumInfo.CName, "int", $"static_cast<int>({name})");
+
+        if (ArithName(canonical) is { } scalar)
+            return (scalar, scalar, name);
+
+        throw new NotSupportedException($"不支持的信号参数类型 {clang.getTypeSpelling(type)}");
+    }
+
+    private void BindSignal(ClassInfo info, CXCursor signal, string name)
+    {
+        string snake = name.Underscore();
+        string callbackName = UniqueName($"{info.CName}_{snake}_callback");
+        List<string> hTypes = ["void*"];
+        List<string> cTypes = ["void*"];
+        List<string> lambdaParameters = [];
+        List<string> callArguments = ["user"];
+        List<string> cppTypes = [];
+
+        int count = clang.Cursor_getNumArguments(signal);
+        for (int i = 0; i < count; i++)
+        {
+            CXType type = clang.getCursorType(clang.Cursor_getArgument(signal, (uint)i));
+            var (h, c, expression) = ConvertCallbackArgument(type, $"p{i}");
+            string cppType = clang.getTypeSpelling(type).ToString();
+            hTypes.Add(h);
+            cTypes.Add(c);
+            cppTypes.Add(cppType);
+            lambdaParameters.Add($"{cppType} p{i}");
+            callArguments.Add(expression);
+        }
+
+        CXCursor declaring = clang.getCursorSemanticParent(signal);
+        string declaringName = QualifiedName(declaring).Cpp ?? info.CppName;
+        bool overloaded = CExportGenerator.ChildrenOf(declaring).Count(c =>
+            clang.getCursorKind(c) is CXCursorKind.CXCursor_CXXMethod
+            && Spelling(c) == name) > 1;
+        string pointer = overloaded
+            ? $"static_cast<void ({declaringName}::*)({string.Join(", ", cppTypes)})>(&{declaringName}::{name})"
+            : $"&{declaringName}::{name}";
+
+        _headerDeclarations.Add($"typedef void (CPPM_CALL *{callbackName})({string.Join(", ", hTypes)});");
+        _sourceTypedefs.Add($"typedef void (CPPM_CALL *{callbackName})({string.Join(", ", cTypes)});");
+        _connectionUsed = true;
+
+        string sender = $"static_cast<{info.CppName}*>({SelfName})";
+        Add(
+            UniqueName($"{info.CName}_connect_{snake}"),
+            new("cppm_qt_connection*", "void*", x => x),
+            [
+                new(info.CName + "*", "void*", SelfName),
+                new(callbackName, callbackName, "callback"),
+                new("void*", "void*", "user"),
+            ],
+            $"new QMetaObject::Connection(QObject::connect({sender}, {pointer}, {sender}, [callback, user]({string.Join(", ", lambdaParameters)}) {{ callback({string.Join(", ", callArguments)}); }}))");
+    }
+
+    private void BindConnectionDestroy()
+        => Add(
+            UniqueName("cppm_qt_connection_destroy"),
+            new("void", "void", x => x),
+            [new("cppm_qt_connection*", "void*", SelfName)],
+            $"[&] {{ auto* connection = static_cast<QMetaObject::Connection*>({SelfName}); QObject::disconnect(*connection); delete connection; }}()",
+            isStatement: true);
 
     private void TryBind(ClassInfo info, string description, Action bind)
     {
@@ -710,6 +937,8 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
             .Where(c => _usedClasses.Contains(Usr(c.Cursor)))
             .OrderBy(c => c.CName, StringComparer.Ordinal)
             .Select(c => $"typedef struct {c.CName} {c.CName};"));
+        if (_connectionUsed)
+            classes += "\ntypedef struct cppm_qt_connection cppm_qt_connection;";
 
         string enums = string.Join("\n\n", _enums.Values
             .OrderBy(e => e.CName, StringComparer.Ordinal)
@@ -769,11 +998,14 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
     {
         string includes = string.Join("\n", headers.Select(h => $"#include \"{h.Replace('\\', '/')}\""));
         string definitions = string.Join("\n\n", _sourceDefinitions);
+        string typedefs = string.Join("\n", _sourceTypedefs);
 
         return Lf($$"""
             // 由 OBSharp.Interop.NativeBindGenerator --cpp-redirect 生成，请勿手工修改。
             #include "{{CppMarshaller.FileName}}"
             {{includes}}
+
+            {{typedefs}}
 
             CPPM_EXPORT void CPPM_CALL cppm_free_memory(void* pointer)
             {
