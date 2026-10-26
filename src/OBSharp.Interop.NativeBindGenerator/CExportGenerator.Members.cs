@@ -59,6 +59,8 @@ internal sealed partial class CExportGenerator
     private void BuildMembers()
     {
         Dictionary<string, List<(FunctionModel Function, string Remainder)>> groups = [];
+        Dictionary<string, List<(FunctionModel Function, string Remainder)>> statics = [];
+        HashSet<FunctionModel> grouped = [];
         foreach (FunctionModel function in _models)
         {
             if (function.Parameters is not [{ } first, ..]
@@ -75,19 +77,43 @@ internal sealed partial class CExportGenerator
             if (!groups.TryGetValue(typeName, out var list))
                 groups[typeName] = list = [];
             list.Add((function, function.Name[(owner.CName.Length + 1)..]));
+            grouped.Add(function);
         }
 
-        foreach ((string typeName, var members) in groups)
+        // 名称带类型前缀、但首参不是该类型的函数（如 X_create）归为静态成员
+        foreach (FunctionModel function in _models.Where(f => !grouped.Contains(f) && !_releaseFunctions.ContainsKey(f.Name)))
+        {
+            var match = _owners
+                .Where(o => function.Name.Length > o.Value.CName.Length + 1
+                    && function.Name.StartsWith(o.Value.CName + "_", StringComparison.Ordinal))
+                .OrderByDescending(o => o.Value.CName.Length)
+                .Select(o => (Key: o.Key, o.Value))
+                .FirstOrDefault();
+            if (match.Key is null)
+                continue;
+
+            string typeName = match.Value.IsHandle ? match.Key : match.Key[..^1];
+            if (!statics.TryGetValue(typeName, out var list))
+                statics[typeName] = list = [];
+            list.Add((function, function.Name[(match.Value.CName.Length + 1)..]));
+        }
+
+        foreach (string typeName in groups.Keys.Union(statics.Keys))
         {
             bool isHandle = _owners.ContainsKey(typeName);
-            _typeSources[typeName + "#members"] = MembersSource(typeName, isHandle, members);
+            _typeSources[typeName + "#members"] = MembersSource(
+                typeName,
+                isHandle,
+                groups.GetValueOrDefault(typeName) ?? [],
+                statics.GetValueOrDefault(typeName) ?? []);
         }
     }
 
     private string MembersSource(
         string typeName,
         bool isHandle,
-        List<(FunctionModel Function, string Remainder)> members)
+        List<(FunctionModel Function, string Remainder)> members,
+        List<(FunctionModel Function, string Remainder)> staticMembers)
     {
         Dictionary<string, PropertyModel> properties = new(StringComparer.Ordinal);
         List<(FunctionModel Function, string Name)> methods = [];
@@ -171,57 +197,112 @@ internal sealed partial class CExportGenerator
             }
         }
 
-        StringBuilder source = new();
-        source.AppendLine(isHandle
+        string kind = isHandle
             ? $"public sealed unsafe partial class {typeName}"
-            : $"public unsafe partial struct {typeName}");
-        source.AppendLine("{");
+            : $"public unsafe partial struct {typeName}";
 
         List<string> blocks = [];
         foreach ((string name, PropertyModel property) in properties.OrderBy(p => p.Key, StringComparer.Ordinal))
         {
-            StringBuilder block = new();
-            block.AppendLine($"    public {property.Type} {name}");
-            block.AppendLine("    {");
+            List<string> accessors = [];
             if (property.Getter is not null)
             {
-                block.AppendLine("        get");
-                block.AppendLine("        {");
-                AppendBody(block, property.Getter, typeName, isHandle, 12, "return ");
-                block.AppendLine("        }");
+                accessors.Add($$"""
+                            get
+                            {
+                    {{Body(property.Getter, typeName, isHandle, 12, "return ")}}
+                            }
+                    """);
             }
 
             if (property.Setter is not null)
             {
-                block.AppendLine("        set");
-                block.AppendLine("        {");
-                AppendBody(block, property.Setter, typeName, isHandle, 12, "", "value");
-                block.AppendLine("        }");
+                accessors.Add($$"""
+                            set
+                            {
+                    {{Body(property.Setter, typeName, isHandle, 12, "", "value")}}
+                            }
+                    """);
             }
 
-            block.Append("    }");
-            blocks.Add(block.ToString());
+            blocks.Add($$"""
+                    public {{property.Type}} {{name}}
+                    {
+                {{string.Join("\n", accessors)}}
+                    }
+                """);
         }
 
         foreach ((FunctionModel function, string name) in methods.OrderBy(m => m.Name, StringComparer.Ordinal))
         {
             string parameters = string.Join(", ", function.Parameters.Skip(1)
                 .Select(p => $"{p.Type.Modifier}{p.Type.Type} {p.Name}"));
-            StringBuilder block = new();
-            block.AppendLine($"    public {function.Return.Type} {name}({parameters})");
-            block.AppendLine("    {");
-            AppendBody(block, function, typeName, isHandle, 8, function.Return.Type is "void" ? "" : "return ");
-            block.Append("    }");
-            blocks.Add(block.ToString());
+            blocks.Add($$"""
+                    public {{function.Return.Type}} {{name}}({{parameters}})
+                    {
+                {{Body(function, typeName, isHandle, 8, function.Return.Type is "void" ? "" : "return ")}}
+                    }
+                """);
         }
 
-        source.AppendLine(string.Join(Environment.NewLine + Environment.NewLine, blocks));
-        source.Append('}');
-        return source.ToString();
+        HashSet<string> constructorSignatures = [];
+        foreach ((FunctionModel function, string raw) in staticMembers.OrderBy(m => m.Remainder, StringComparer.Ordinal))
+        {
+            string parameters = string.Join(", ", function.Parameters
+                .Select(p => $"{p.Type.Modifier}{p.Type.Type} {p.Name}"));
+            string arguments = string.Join(", ", function.Parameters.Select(p => p.Type.Modifier + p.Name));
+            string call = $"NativeMethods.{Identifier(function.Name)}({arguments})";
+
+            // 返回自身类型的 create/new 工厂函数写成构造函数；
+            // SafeHandle 的无参构造函数已被 marshaller 占用，无参工厂保持静态方法
+            if (IsFactoryName(raw)
+                && function.Return.Type == typeName
+                && (!isHandle || function.Parameters.Count is not 0)
+                && constructorSignatures.Add(string.Join(",", function.Parameters.Select(p => p.Type.Modifier + p.Type.Type))))
+            {
+                // SafeHandle 通过转移已创建句柄的所有权完成构造
+                string constructor = isHandle
+                    ? $$"""
+                            public {{typeName}}({{parameters}}) : this()
+                            {
+                                using var created = {{call}};
+                                SetHandle(created.DangerousGetHandle());
+                                created.SetHandleAsInvalid();
+                            }
+                        """
+                    : $$"""
+                            public {{typeName}}({{parameters}})
+                            {
+                                this = {{call}};
+                            }
+                        """;
+                blocks.Insert(0, constructor);
+                continue;
+            }
+
+            blocks.Add($$"""
+                    public static {{function.Return.Type}} {{MemberName(raw)}}({{parameters}})
+                    {
+                        {{(function.Return.Type is "void" ? "" : "return ")}}{{call}};
+                    }
+                """);
+        }
+
+        string body = string.Join("\n\n", blocks);
+        return $$"""
+            {{kind}}
+            {
+            {{body}}
+            }
+            """;
     }
 
-    private static void AppendBody(
-        StringBuilder builder,
+    private static bool IsFactoryName(string remainder)
+        => remainder is "create" or "new"
+            || remainder.StartsWith("create_", StringComparison.Ordinal)
+            || remainder.StartsWith("new_", StringComparison.Ordinal);
+
+    private static string Body(
         FunctionModel function,
         string typeName,
         bool isHandle,
@@ -240,13 +321,11 @@ internal sealed partial class CExportGenerator
         }
 
         string call = $"{prefix}NativeMethods.{Identifier(function.Name)}({string.Join(", ", arguments)});";
-        if (isHandle)
-        {
-            builder.AppendLine(pad + call);
-            return;
-        }
-
-        builder.AppendLine($"{pad}fixed ({typeName}* self = &this)");
-        builder.AppendLine($"{pad}    {call}");
+        return isHandle
+            ? pad + call
+            : $$"""
+                {{pad}}fixed ({{typeName}}* self = &this)
+                {{pad}}    {{call}}
+                """;
     }
 }

@@ -336,28 +336,25 @@ internal sealed unsafe partial class CExportGenerator
         foreach ((uint key, string name) in _handleNames)
         {
             bool hasRelease = _handleReleases.TryGetValue(key, out string? release);
-            using StringWriter source = new()
-            {
-                NewLine = "\n"
-            };
-            source.WriteLine($"public sealed partial class {name} : SafeHandle");
-            source.WriteLine("{");
-            source.WriteLine($"    public {name}() : base(IntPtr.Zero, {(hasRelease ? "true" : "false")})");
-            source.WriteLine("    {");
-            source.WriteLine("    }");
-            source.WriteLine();
-            source.WriteLine("    public override bool IsInvalid => handle == IntPtr.Zero;");
-            source.WriteLine();
-            source.WriteLine("    protected override bool ReleaseHandle()");
-            source.WriteLine("    {");
-            if (hasRelease)
-                source.WriteLine($"        NativeMethods.{Identifier(release!)}(handle);");
-            else
-                source.WriteLine("        // 头文件中没有识别到释放函数，句柄不拥有原生对象");
-            source.WriteLine("        return true;");
-            source.WriteLine("    }");
-            source.Write('}');
-            _typeSources[name] = source.ToString();
+            string releaseCall = hasRelease
+                ? $"NativeMethods.{Identifier(release!)}(handle);"
+                : "// 头文件中没有识别到释放函数，句柄不拥有原生对象";
+            _typeSources[name] = $$"""
+                public sealed partial class {{name}} : SafeHandle
+                {
+                    public {{name}}() : base(IntPtr.Zero, {{(hasRelease ? "true" : "false")}})
+                    {
+                    }
+
+                    public override bool IsInvalid => handle == IntPtr.Zero;
+
+                    protected override bool ReleaseHandle()
+                    {
+                        {{releaseCall}}
+                        return true;
+                    }
+                }
+                """;
         }
     }
 
@@ -379,23 +376,22 @@ internal sealed unsafe partial class CExportGenerator
         string underlying = MapType(clang.getEnumDeclIntegerType(definition), TypePosition.Field).Type;
         bool isSigned = underlying is "sbyte" or "short" or "int" or "long";
 
-        using StringWriter source = new()
-        {
-            NewLine = "\n"
-        };
-        source.WriteLine($"public enum {name} : {underlying}");
-        source.WriteLine("{");
-        foreach (CXCursor constant in ChildrenOf(definition)
-            .Where(c => clang.getCursorKind(c) is CXCursorKind.CXCursor_EnumConstantDecl))
-        {
-            string value = isSigned
-                ? clang.getEnumConstantDeclValue(constant).ToString()
-                : clang.getEnumConstantDeclUnsignedValue(constant).ToString();
-            source.WriteLine($"    {Identifier(clang.getCursorSpelling(constant).ToString())} = {value},");
-        }
+        string members = string.Join("\n", ChildrenOf(definition)
+            .Where(c => clang.getCursorKind(c) is CXCursorKind.CXCursor_EnumConstantDecl)
+            .Select(constant =>
+            {
+                string value = isSigned
+                    ? clang.getEnumConstantDeclValue(constant).ToString()
+                    : clang.getEnumConstantDeclUnsignedValue(constant).ToString();
+                return $"    {Identifier(clang.getCursorSpelling(constant).ToString())} = {value},";
+            }));
 
-        source.Write('}');
-        _typeSources[name] = source.ToString();
+        _typeSources[name] = $$"""
+            public enum {{name}} : {{underlying}}
+            {
+            {{members}}
+            }
+            """;
         return name;
     }
 
@@ -462,40 +458,41 @@ internal sealed unsafe partial class CExportGenerator
         }
 
         int? pack = isUnion || hasBitFields ? null : FindPack(fields, structSize);
-        using StringWriter source = new()
-        {
-            NewLine = "\n"
-        };
         bool isExplicit = pack is null;
-        source.WriteLine(isExplicit
+        string layout = isExplicit
             ? $"[StructLayout(LayoutKind.Explicit, Size = {structSize})]"
             : pack is 0
                 ? "[StructLayout(LayoutKind.Sequential)]"
-                : $"[StructLayout(LayoutKind.Sequential, Pack = {pack})]");
-        source.WriteLine($"public unsafe partial struct {name}");
-        source.WriteLine("{");
+                : $"[StructLayout(LayoutKind.Sequential, Pack = {pack})]";
 
+        List<string> lines = [];
         if (hasBitFields)
-            source.WriteLine("    // 位域无法直接映射，整体按存储单元处理");
+            lines.Add("    // 位域无法直接映射，整体按存储单元处理");
         if (hasBitFields
             && fields.Count is 0
             && BitStorageType(structSize) is { } storage)
         {
-            source.WriteLine("    [FieldOffset(0)]");
-            source.WriteLine($"    public {storage} Value;");
+            lines.Add("    [FieldOffset(0)]");
+            lines.Add($"    public {storage} Value;");
         }
 
         foreach (FieldInfo field in fields)
         {
             if (isExplicit)
-                source.WriteLine($"    [FieldOffset({field.OffsetBytes})]");
-            source.WriteLine(field.FixedCount is null
+                lines.Add($"    [FieldOffset({field.OffsetBytes})]");
+            lines.Add(field.FixedCount is null
                 ? $"    public {field.TypeText} {field.Name};"
                 : $"    public fixed {field.TypeText} {field.Name}[{field.FixedCount}];");
         }
 
-        source.Write('}');
-        return source.ToString();
+        string body = string.Join("\n", lines);
+        return $$"""
+            {{layout}}
+            public unsafe partial struct {{name}}
+            {
+            {{body}}
+            }
+            """;
     }
 
     private static string? BitStorageType(long size)
@@ -520,12 +517,13 @@ internal sealed unsafe partial class CExportGenerator
                 return (element, count.ToString());
 
             string bufferName = $"{owner}_{fieldName.TrimStart('@')}_Buffer";
-            _typeSources[bufferName] =
-                $"[InlineArray({count})]{Environment.NewLine}"
-                + $"public unsafe struct {bufferName}{Environment.NewLine}"
-                + $"{{{Environment.NewLine}"
-                + $"    private {element} _element0;{Environment.NewLine}"
-                + "}";
+            _typeSources[bufferName] = $$"""
+                [InlineArray({{count}})]
+                public unsafe struct {{bufferName}}
+                {
+                    private {{element}} _element0;
+                }
+                """;
             return (bufferName, null);
         }
 

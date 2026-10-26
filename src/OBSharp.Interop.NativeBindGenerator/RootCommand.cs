@@ -3,7 +3,7 @@ using DotMake.CommandLine;
 namespace OBSharp.Interop.NativeBindGenerator;
 
 /// <summary>
-/// 依据 C 导出声明生成 C# 绑定。
+/// 依据 C 导出声明生成 C# 绑定；可选地先为 C++ 类生成 C 式导出。
 /// </summary>
 /// <remarks>
 /// 用法：<c>NativeBindGenerator [生成器参数] -- [clang 参数]</c>。
@@ -14,7 +14,7 @@ namespace OBSharp.Interop.NativeBindGenerator;
     TreatUnmatchedTokensAsErrors = false)]
 public class RootCommand : ICExportGeneratorOptions
 {
-    [CliOption(Description = "要解析的 C 头文件；可重复指定")]
+    [CliOption(Description = "要解析的头文件；可重复指定")]
     public string[] Header { get; set; } = [];
 
     [CliOption(Alias = "n", Description = "生成 C# 代码的命名空间")]
@@ -35,28 +35,43 @@ public class RootCommand : ICExportGeneratorOptions
     [CliOption(Description = "const char* 返回值使用的自定义 marshaller 类型名，默认 LPUTF8Str")]
     public string ReturnStringMarshaller { get; set; } = "";
 
+    [CliOption(Description = "把 --header 中的 C++ 类自动转发为 C 式导出（生成 native 代码），再据此生成 C# 绑定")]
+    public bool CppRedirect { get; set; }
+
+    [CliOption(Description = "--cpp-redirect 的 native 产物目录")]
+    public string NativeOutput { get; set; } = "generated/native";
+
+    [CliOption(Description = "--cpp-redirect 生成的 native 文件基名（.h / .cpp）")]
+    public string NativeName { get; set; } = "cpp_exports";
+
     /// <summary>
-    /// <c>--</c> 之后原样传递给 clang 的参数。
+    /// <c>--</c> 之后原样传给 clang 的参数。
     /// </summary>
     public string[] ClangArguments { get; private set; } = [];
 
-    public void Run(CliContext context)
+    public int Run(CliContext context)
     {
         ClangArguments = [.. context.Result.ParseResult.UnmatchedTokens];
 
-        if (Header.Length is 0)
-            throw new ArgumentException("至少需要通过 --header 指定一个头文件");
-        foreach (string header in Header)
+        if (Header is { Length: 0 })
         {
-            if (!File.Exists(header))
-                throw new FileNotFoundException("头文件不存在", header);
+            Console.Error.WriteLine("必须通过 --header 至少指定一个头文件");
+            return 1;
         }
 
-        if (Namespace.Length is 0)
-            throw new ArgumentException("--namespace 不能为空");
-        if (LibraryName.Length is 0)
-            throw new ArgumentException("--library-name 不能为空");
+        try
+        {
+            if (CppRedirect)
+                new CppRedirectGenerator(this).Generate();
+            else
+                new CExportGenerator(this).Generate();
+        }
+        catch (InvalidOperationException ex)
+        {
+            Console.Error.WriteLine(ex.Message);
+            return 1;
+        }
 
-        new CExportGenerator(this).Generate();
+        return 0;
     }
 }

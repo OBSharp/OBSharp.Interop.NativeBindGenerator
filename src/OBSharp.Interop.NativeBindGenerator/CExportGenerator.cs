@@ -27,7 +27,7 @@ internal sealed unsafe partial class CExportGenerator(ICExportGeneratorOptions o
         return CXChildVisitResult.CXChildVisit_Continue;
     }
 
-    private static List<CXCursor> ChildrenOf(CXCursor cursor)
+    internal static List<CXCursor> ChildrenOf(CXCursor cursor)
     {
         List<CXCursor> children = [];
         s_children = children;
@@ -52,6 +52,11 @@ internal sealed unsafe partial class CExportGenerator(ICExportGeneratorOptions o
     private readonly List<(string Name, string Source)> _functions = [];
     private HashSet<string> _headers = [with(PathComparer)];
 
+    /// <summary>
+    /// 临时翻译单元文件名；扩展名决定 clang 按 C 还是 C++ 解析。
+    /// </summary>
+    internal string TuFileName { get; init; } = "exports.c";
+
     public void Generate()
     {
         LibClangLoader.Ensure();
@@ -63,7 +68,7 @@ internal sealed unsafe partial class CExportGenerator(ICExportGeneratorOptions o
         Directory.CreateDirectory(staging);
         try
         {
-            string tuPath = Path.Combine(staging, "exports.c");
+            string tuPath = Path.Combine(staging, TuFileName);
             File.WriteAllLines(tuPath, headers.Select(header =>
                 $"#include \"{header.Replace('\\', '/').Replace("\"", "\\\"")}\""));
 
@@ -108,7 +113,7 @@ internal sealed unsafe partial class CExportGenerator(ICExportGeneratorOptions o
         Console.WriteLine($"生成了 {_functions.Count} 个函数、{_typeSources.Count} 个类型的 C# 绑定。");
     }
 
-    private static bool ReportErrors(CXTranslationUnit tu)
+    internal static bool ReportErrors(CXTranslationUnit tu)
     {
         bool hasError = false;
         uint count = clang.getNumDiagnostics(tu);
@@ -129,6 +134,21 @@ internal sealed unsafe partial class CExportGenerator(ICExportGeneratorOptions o
         return hasError;
     }
 
+    // 展开 extern "C" { } 块，使其中的声明与顶层声明一视同仁
+    private static List<CXCursor> Flatten(List<CXCursor> cursors)
+    {
+        List<CXCursor> result = [];
+        foreach (CXCursor cursor in cursors)
+        {
+            if (clang.getCursorKind(cursor) is CXCursorKind.CXCursor_LinkageSpec)
+                result.AddRange(Flatten(ChildrenOf(cursor)));
+            else
+                result.Add(cursor);
+        }
+
+        return result;
+    }
+
     private bool IsInHeaders(CXCursor cursor)
     {
         clang.getCursorLocation(cursor).GetExpansionLocation(out CXFile file, out _, out _, out _);
@@ -139,7 +159,7 @@ internal sealed unsafe partial class CExportGenerator(ICExportGeneratorOptions o
 
     private void Collect(CXTranslationUnit tu)
     {
-        List<CXCursor> top = ChildrenOf(clang.getTranslationUnitCursor(tu));
+        List<CXCursor> top = Flatten(ChildrenOf(clang.getTranslationUnitCursor(tu)));
 
         foreach (CXCursor cursor in top.Where(c => clang.getCursorKind(c) is CXCursorKind.CXCursor_TypedefDecl))
         {
@@ -235,17 +255,14 @@ internal sealed unsafe partial class CExportGenerator(ICExportGeneratorOptions o
         _currentFunction = "";
         _models.Add(new(name, returnType, models));
 
-        using StringWriter source = new()
-        {
-            NewLine = "\n"
-        };
-        source.WriteLine($"    [LibraryImport(LibraryName, EntryPoint = \"{Escape(name)}\")]");
-        source.WriteLine(
-            $"    [UnmanagedCallConv(CallConvs = [typeof({CallConvType(clang.getFunctionTypeCallingConv(functionType))})])]");
-        if (returnType.Attribute.Length is not 0)
-            source.WriteLine($"    [return: {returnType.Attribute.Trim().TrimStart('[').TrimEnd(']')}]");
-        source.Write($"    public static partial {returnType.Type} {Identifier(name)}({string.Join(", ", parameters)});");
-        return source.ToString();
+        string attributes = returnType.Attribute.Length is 0
+            ? ""
+            : $"    [return: {returnType.Attribute.Trim().TrimStart('[').TrimEnd(']')}]\n";
+        return $$"""
+                [LibraryImport(LibraryName, EntryPoint = "{{Escape(name)}}")]
+                [UnmanagedCallConv(CallConvs = [typeof({{CallConvType(clang.getFunctionTypeCallingConv(functionType))}})])]
+            {{attributes}}    public static partial {{returnType.Type}} {{Identifier(name)}}({{string.Join(", ", parameters)}});
+            """;
     }
 
     private static string CallConvType(CXCallingConv convention)
@@ -264,50 +281,50 @@ internal sealed unsafe partial class CExportGenerator(ICExportGeneratorOptions o
         foreach (string staleFile in Directory.EnumerateFiles(output, "*.g.cs", SearchOption.AllDirectories))
             File.Delete(staleFile);
 
-        using StringWriter methods = new()
-        {
-            NewLine = "\n"
-        };
-        WriteHeader(methods);
-        methods.WriteLine("public static unsafe partial class NativeMethods");
-        methods.WriteLine("{");
-        methods.WriteLine($"    private const string LibraryName = \"{Escape(options.LibraryName)}\";");
-        foreach ((string _, string source) in _functions.OrderBy(f => f.Name, StringComparer.Ordinal))
-        {
-            methods.WriteLine();
-            methods.WriteLine(source);
-        }
+        string methodSources = string.Join("\n\n", _functions
+            .OrderBy(f => f.Name, StringComparer.Ordinal)
+            .Select(f => f.Source));
+        string methods = $$"""
+            {{Header()}}
+            public static unsafe partial class NativeMethods
+            {
+                private const string LibraryName = "{{Escape(options.LibraryName)}}";
 
-        methods.WriteLine("}");
-        File.WriteAllText(Path.Combine(output, "NativeMethods.g.cs"), methods.ToString(), new UTF8Encoding(false));
+            {{methodSources}}
+            }
+
+            """;
+        File.WriteAllText(Path.Combine(output, "NativeMethods.g.cs"), methods.ReplaceLineEndings("\n"), new UTF8Encoding(false));
 
         if (_typeSources.Count is 0)
             return;
 
-        using StringWriter types = new()
-        {
-            NewLine = "\n"
-        };
-        WriteHeader(types);
-        types.WriteLine(string.Join(
-            Environment.NewLine + Environment.NewLine,
-            _typeSources.OrderBy(t => t.Key, StringComparer.Ordinal).Select(t => t.Value)));
-        File.WriteAllText(Path.Combine(output, "NativeTypes.g.cs"), types.ToString(), new UTF8Encoding(false));
+        string typeSources = string.Join("\n\n", _typeSources
+            .OrderBy(t => t.Key, StringComparer.Ordinal)
+            .Select(t => t.Value));
+        string types = $$"""
+            {{Header()}}
+            {{typeSources}}
+
+            """;
+        File.WriteAllText(Path.Combine(output, "NativeTypes.g.cs"), types.ReplaceLineEndings("\n"), new UTF8Encoding(false));
     }
 
-    private void WriteHeader(StringWriter builder)
-    {
-        builder.WriteLine("// <auto-generated>");
-        builder.WriteLine("// Generated by OBSharp.Interop.NativeBindGenerator. Do not edit.");
-        builder.WriteLine("// </auto-generated>");
-        builder.WriteLine("#nullable enable");
-        builder.WriteLine("using System.Runtime.CompilerServices;");
-        builder.WriteLine("using System.Runtime.InteropServices;");
-        builder.WriteLine("using System.Runtime.InteropServices.Marshalling;");
-        builder.WriteLine();
-        builder.WriteLine($"namespace {options.Namespace};");
-        builder.WriteLine();
-    }
+    private string Header()
+        => $$"""
+            // <auto-generated>
+            // Generated by OBSharp.Interop.NativeBindGenerator. Do not edit.
+            // </auto-generated>
+
+            #nullable enable
+
+            using System.Runtime.CompilerServices;
+            using System.Runtime.InteropServices;
+            using System.Runtime.InteropServices.Marshalling;
+
+            namespace {{options.Namespace}};
+
+            """;
 
     private static string Escape(string value)
         => value.Replace("\\", "\\\\", StringComparison.Ordinal)
