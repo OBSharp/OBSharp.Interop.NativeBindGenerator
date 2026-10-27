@@ -2,8 +2,45 @@
   <!-- See https://aka.ms/dotnet/msbuild/customize for more details on customizing your build -->
   <PropertyGroup>
     <TargetFramework>net11.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+  </PropertyGroup>
+
+  <PropertyGroup>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <IsAotCompatible>true</IsAotCompatible>
+    <Deterministic>True</Deterministic>
   </PropertyGroup>
+
+  <PropertyGroup>
+    <Authors>OBSharp</Authors>
+    <Copyright>Copyright © $([System.DateTime]::Now.ToString("yyyy")) $(Authors)</Copyright>
+    <PackageProjectUrl>https://github.com/OBSharp/OBSharp.Interop.NativeBindGenerator</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/OBSharp/OBSharp.Interop.NativeBindGenerator.git</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageRequireLicenseAcceptance>True</PackageRequireLicenseAcceptance>
+    <GenerateDocumentationFile>True</GenerateDocumentationFile>
+    <IncludeSymbols>True</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <IconPath Condition=" '$(IconPath)' == '' AND Exists('$(MSBuildProjectDirectory)\Assets\logo.png')">$(MSBuildProjectDirectory)\Assets\logo.png</IconPath>
+    <IconPath Condition=" '$(IconPath)' == '' AND Exists('$(MSBuildThisFileDirectory)\assets\logo.png')">$(MSBuildThisFileDirectory)\assets\logo.png</IconPath>
+    <PackageIcon Condition=" '$(IconPath)' != '' ">logo.png</PackageIcon>
+    <ReadmeFile Condition=" '$(ReadmeFile)' == '' AND Exists('$(MSBuildProjectDirectory)\ReadMe.md')">$(MSBuildProjectDirectory)\ReadMe.md</ReadmeFile>
+    <ReadmeFile Condition=" '$(ReadmeFile)' == '' AND Exists('$(MSBuildThisFileDirectory)\ReadMe.md')">$(MSBuildThisFileDirectory)\ReadMe.md</ReadmeFile>
+    <PackageReadmeFile Condition=" '$(ReadmeFile)' != '' ">ReadMe.md</PackageReadmeFile>
+    <EmbedUntrackedSources>true</EmbedUntrackedSources>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <EnforceCodeStyleInBuild>True</EnforceCodeStyleInBuild>
+    <EnableNETAnalyzers>True</EnableNETAnalyzers>
+    <AnalysisLevel>latest-recommended</AnalysisLevel>
+    <NoWarn>$(NoWarn);1591;CA1711;CA1716</NoWarn>
+  </PropertyGroup>
+
+  <Import Project="$(MSBuildThisFileDirectory)Directory.Version.props" Condition="Exists('$(MSBuildThisFileDirectory)Directory.Version.props')" />
+
 </Project>

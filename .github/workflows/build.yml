@@ -1,0 +1,177 @@
+name: 构建
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: 
+  contents: read
+
+defaults:
+  run:
+    shell: pwsh
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: 1
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      artifact-url: ${{ steps.artifact.outputs.artifact-url }}
+      artifact-digest: ${{ steps.artifact.outputs.artifact-digest }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: 配置 .Net 环境
+        uses: actions/setup-dotnet@v6
+        with:
+          global-json-file: ./global.json
+
+      - name: 配置 Nuget 源
+        run: |-
+          dotnet nuget update source `
+            --username USERNAME `
+            --password "${{ github.token }}" `
+            --store-password-in-clear-text `
+            --name OBSharp `
+            "https://nuget.pkg.github.com/OBSharp/index.json"
+
+      - name: 初始化 GitVersion
+        uses: gittools/actions/gitversion/setup@v4
+        with:
+          versionSpec: "6.8.x"
+          nugetConfigPath: "./nuget.config"
+
+      - name: 计算版本号
+        id: gitversion
+        uses: gittools/actions/gitversion/execute@v4
+        with:
+          overrideConfig: |-
+            assembly-versioning-scheme=MajorMinorPatchTag
+            assembly-file-versioning-format="{Major}.{Minor}.{Patch}.{BuildMetaData ?? 0}"
+
+      - name: 生成版本文件
+        shell: pwsh
+        run: |-
+          "<Project>" > Directory.Version.props
+          "  <PropertyGroup>" >> Directory.Version.props
+          "    <Version>${{ steps.gitversion.outputs.semVer }}</Version>" >> Directory.Version.props
+          "    <VersionPrefix>${{ steps.gitversion.outputs.majorMinorPatch }}</VersionPrefix>" >> Directory.Version.props
+          "    <VersionSuffix>${{ steps.gitversion.outputs.preReleaseTag }}</VersionSuffix>" >> Directory.Version.props
+          "    <PackageVersion>${{ steps.gitversion.outputs.fullSemVer }}</PackageVersion>" >> Directory.Version.props
+          "    <InformationalVersion>${{ steps.gitversion.outputs.informationalVersion }}</InformationalVersion>" >> Directory.Version.props
+          "    <AssemblyVersion>${{ steps.gitversion.outputs.assemblySemVer }}</AssemblyVersion>" >> Directory.Version.props
+          "    <FileVersion>${{ steps.gitversion.outputs.assemblySemFileVer }}</FileVersion>" >> Directory.Version.props
+          "    <RepositoryBranch>${{ steps.gitversion.outputs.branchName }}</RepositoryBranch>" >> Directory.Version.props
+          "    <RepositoryCommit>${{ steps.gitversion.outputs.sha }}</RepositoryCommit>" >> Directory.Version.props
+          "  </PropertyGroup>" >> Directory.Version.props
+          "</Project>" >> Directory.Version.props
+
+      - name: 还原
+        run: dotnet restore --graph --artifacts-path artifacts
+
+      - name: 生成
+        run: dotnet build --graph --artifacts-path artifacts --configuration Release --no-restore
+
+      - name: 打包
+        run: dotnet pack --graph --artifacts-path artifacts --configuration Release --no-restore --no-build --include-symbols --include-source
+
+      - name: 生成校验和
+        shell: pwsh
+        run: |
+          $Private:Algorithm = 'SHA256'
+          Write-Output "### Build Success :rocket: ">> $env:GITHUB_STEP_SUMMARY
+          Write-Output "|FileName|$Private:Algorithm|" >> $env:GITHUB_STEP_SUMMARY
+          Write-Output "|:-|:-:|" >> $env:GITHUB_STEP_SUMMARY
+          Get-ChildItem artifacts/package/release | ForEach-Object {
+            $Private:Name = $PSItem.Name
+            $Private:FileHashResult = Get-FileHash $PSItem -Algorithm $Private:Algorithm
+            $Private:FileHash = $Private:FileHashResult.Hash
+            Write-Output "|$Private:Name|$Private:FileHash|" >> $env:GITHUB_STEP_SUMMARY
+          }
+
+      - name: 收集 Nuget 包
+        id: artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: nuget-packages
+          path: |
+            artifacts/package/release/*
+          retention-days: 3
+
+  comment:
+    needs: build
+    name: 评论
+    if: github.event_name == 'pull_request'
+    permissions: 
+      pull-requests: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: 在 PR 里发送评论
+        run: |-
+          gh pr comment ${{ github.event.pull_request.number }} `
+            --body @"## :rocket: Build artifacts are available
+              ||SHA256|
+              |:-|:-:|
+              |[Download Nuget Package](${{ needs.build.outputs.artifact-url }})|${{ needs.build.outputs.artifact-digest }}|
+              "@ `
+            --create-if-none `
+            --edit-last
+
+  release:
+    needs: build
+    name: 发布
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+      discussions: write
+      packages: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: 签出仓库
+        uses: actions/checkout@v7
+        with:
+          sparse-checkout: "."
+
+      - name: 配置 .Net 环境
+        uses: actions/setup-dotnet@v6
+        with:
+          global-json-file: ./global.json
+          cache: false
+
+      - name: 配置 Nuget 源
+        run: |-
+          dotnet nuget update source `
+            --username USERNAME `
+            --password "${{ github.token }}" `
+            --store-password-in-clear-text `
+            --name OBSharp `
+            "https://nuget.pkg.github.com/OBSharp/index.json"
+
+      - name: Download a Build Artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: nuget-packages
+          path: artifacts
+
+      - name: Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: artifacts/*
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref, '-') }}
+
+      - name: 推送 Nuget 包
+        run: dotnet nuget push artifacts/*.nupkg --source OBSharp --skip-duplicate
+
+  

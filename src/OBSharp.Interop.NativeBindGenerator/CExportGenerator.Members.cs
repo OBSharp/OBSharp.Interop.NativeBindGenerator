@@ -1,5 +1,3 @@
-using System.Text;
-
 using Humanizer;
 
 namespace OBSharp.Interop.NativeBindGenerator;
@@ -109,7 +107,7 @@ internal sealed partial class CExportGenerator
         }
     }
 
-    private string MembersSource(
+    private static string MembersSource(
         string typeName,
         bool isHandle,
         List<(FunctionModel Function, string Remainder)> members,
