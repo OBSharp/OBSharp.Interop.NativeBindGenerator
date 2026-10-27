@@ -39,7 +39,7 @@ jobs:
 
       - name: 配置 Nuget 源
         run: |-
-          dotnet nuget update source OBSharp`
+          dotnet nuget update source OBSharp `
             --username "github-actions[bot]" `
             --password "${{ github.token }}" `
             --store-password-in-clear-text
