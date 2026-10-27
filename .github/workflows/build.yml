@@ -148,12 +148,10 @@ jobs:
 
       - name: 配置 Nuget 源
         run: |-
-          dotnet nuget update source `
-            --username USERNAME `
+          dotnet nuget update source OBSharp `
+            --username "github-actions[bot]" `
             --password "${{ github.token }}" `
-            --store-password-in-clear-text `
-            --name OBSharp `
-            "https://nuget.pkg.github.com/OBSharp/index.json"
+            --store-password-in-clear-text
 
       - name: Download a Build Artifact
         uses: actions/download-artifact@v8
