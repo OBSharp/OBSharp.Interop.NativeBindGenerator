@@ -55,7 +55,6 @@ jobs:
         uses: gittools/actions/gitversion/execute@v4
         with:
           overrideConfig: |-
-            assembly-versioning-scheme=MajorMinorPatchTag
             assembly-file-versioning-format="{Major}.{Minor}.{Patch}.{BuildMetaData ?? 0}"
 
       - name: 生成版本文件
