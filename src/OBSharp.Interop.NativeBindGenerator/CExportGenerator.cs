@@ -65,6 +65,9 @@ internal sealed unsafe partial class CExportGenerator(ICExportGeneratorOptions o
     internal IReadOnlyDictionary<string, string> OriginalSignatures { get; init; }
         = new Dictionary<string, string>(StringComparer.Ordinal);
 
+    internal IReadOnlyDictionary<string, (string ManagedName, string NativeName)> OpaquePointerTypes { get; init; }
+        = new Dictionary<string, (string ManagedName, string NativeName)>(StringComparer.Ordinal);
+
     public void Generate()
     {
         LibClangLoader.Ensure();
@@ -196,6 +199,7 @@ internal sealed unsafe partial class CExportGenerator(ICExportGeneratorOptions o
                 or CXCursorKind.CXCursor_UnionDecl
                 or CXCursorKind.CXCursor_EnumDecl)
                 || clang.isCursorDefinition(cursor) is 0
+                || OpaquePointerTypes.ContainsKey(clang.getCursorSpelling(cursor).ToString())
                 || (IsAnonymous(cursor) && !_anonymousNames.ContainsKey(KeyOf(cursor))))
             {
                 continue;
