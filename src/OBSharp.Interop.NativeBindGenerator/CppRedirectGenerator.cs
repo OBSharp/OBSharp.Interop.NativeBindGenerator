@@ -17,6 +17,8 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
 
     private sealed record EnumInfo(CXCursor Cursor, string CName, string CppName);
 
+    private sealed record OpaquePointerInfo(string CName, string CppName, string ManagedName);
+
     private sealed record Param(string H, string C, string Name);
 
     private sealed record ParamPlan(List<Param> Params, string Argument);
@@ -42,6 +44,8 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
 
     private readonly Dictionary<string, ClassInfo> _classes = [];
     private readonly Dictionary<string, EnumInfo> _enums = [];
+    private readonly Dictionary<string, OpaquePointerInfo> _opaquePointers = [];
+    private readonly HashSet<string> _opaqueManagedNames = [];
     private readonly HashSet<string> _usedClasses = [];
     private readonly HashSet<string> _cNames = [];
     private readonly List<string> _headerDeclarations = [];
@@ -135,6 +139,10 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
             TuFileName = "exports.cpp",
             UseQtArrays = options.Qt,
             OriginalSignatures = _originalSignatures,
+            OpaquePointerTypes = _opaquePointers.Values.ToDictionary(
+                pointer => pointer.CName,
+                pointer => (pointer.ManagedName, pointer.CppName),
+                StringComparer.Ordinal),
         }.Generate();
     }
 
@@ -323,6 +331,42 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
                 ? info
                 : null;
 
+    private OpaquePointerInfo OpaquePointerOf(CXType canonical)
+    {
+        CXCursor declaration = clang.getTypeDeclaration(canonical);
+        string usr = Usr(declaration);
+        if (_opaquePointers.TryGetValue(usr, out OpaquePointerInfo? existing))
+            return existing;
+
+        string cppName = clang.getTypeSpelling(canonical).ToString()
+            .Replace("const ", "", StringComparison.Ordinal)
+            .Replace("volatile ", "", StringComparison.Ordinal)
+            .Trim();
+        int namespaceSeparator = cppName.LastIndexOf("::", StringComparison.Ordinal);
+        string shortName = namespaceSeparator is -1
+            ? cppName
+            : cppName[(namespaceSeparator + 2)..];
+        if (shortName.Length is 0)
+            throw new NotSupportedException($"无法为不透明指针类型 {cppName} 生成名称");
+
+        string managedName = shortName;
+        while (_classes.Values.Any(type => type.CName == managedName)
+            || _enums.Values.Any(type => type.CName == managedName)
+            || !_opaqueManagedNames.Add(managedName))
+        {
+            managedName += "Opaque";
+        }
+
+        string identifier = new(shortName.Select(character =>
+            char.IsLetterOrDigit(character) || character is '_' ? character : '_').ToArray());
+        OpaquePointerInfo pointer = new(
+            UniqueName("nbg_opaque_" + identifier),
+            cppName,
+            managedName);
+        _opaquePointers.Add(usr, pointer);
+        return pointer;
+    }
+
     private ParamPlan ConvertParameter(CXType type, string name)
     {
         CXType canonical = clang.getCanonicalType(type);
@@ -336,7 +380,18 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
                 CXType pointee = clang.getPointeeType(canonical);
                 CXType pointeeCanonical = clang.getCanonicalType(pointee);
                 if (clang.isConstQualifiedType(pointee) is not 0)
+                {
+                    if (pointeeCanonical.kind is CXTypeKind.CXType_Record
+                        && ClassOf(pointeeCanonical) is null)
+                    {
+                        OpaquePointerInfo opaque = OpaquePointerOf(pointeeCanonical);
+                        return new(
+                            [new($"const {opaque.CName}*", "const void*", name)],
+                            $"*static_cast<const {opaque.CppName}*>({name})");
+                    }
+
                     return ConvertValue(pointee, name);
+                }
 
                 if (ClassOf(pointeeCanonical) is { } info)
                 {
@@ -347,6 +402,14 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
 
                 if (ArithName(pointee) is { } arith)
                     return new([new(arith + "*", arith + "*", name)], "*" + name);
+
+                if (pointeeCanonical.kind is CXTypeKind.CXType_Record)
+                {
+                    OpaquePointerInfo opaque = OpaquePointerOf(pointeeCanonical);
+                    return new(
+                        [new(opaque.CName + "*", "void*", name)],
+                        $"*static_cast<{opaque.CppName}*>({name})");
+                }
 
                 throw new NotSupportedException($"不支持的非 const 引用参数 {clang.getTypeSpelling(type)}");
             }
@@ -369,10 +432,12 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
                         $"static_cast<{qualifier}{info.CppName}*>({name})");
                 }
 
-                if (IsForeignQObject(pointeeCanonical))
+                if (pointeeCanonical.kind is CXTypeKind.CXType_Record)
                 {
-                    return new([new($"{qualifier}void*", $"{qualifier}void*", name)],
-                        $"static_cast<{qualifier}{QObjectSpelling(pointeeCanonical)}*>({name})");
+                    OpaquePointerInfo opaque = OpaquePointerOf(pointeeCanonical);
+                    return new(
+                        [new($"{qualifier}{opaque.CName}*", $"{qualifier}void*", name)],
+                        $"static_cast<{qualifier}{opaque.CppName}*>({name})");
                 }
 
                 throw new NotSupportedException($"不支持的指针参数 {clang.getTypeSpelling(type)}");
@@ -455,6 +520,12 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
                     return new("void*", "void*", x => $"cppm::ref_to_void({x})");
                 }
 
+                if (pointeeCanonical.kind is CXTypeKind.CXType_Record)
+                {
+                    OpaquePointerInfo opaque = OpaquePointerOf(pointeeCanonical);
+                    return new(opaque.CName + "*", "void*", x => $"cppm::ref_to_void({x})");
+                }
+
                 return ConvertReturn(pointeeCanonical);
             }
 
@@ -475,8 +546,14 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
                     return new("void*", "void*", x => $"cppm::ptr_to_void({x})");
                 }
 
-                if (IsForeignQObject(pointeeCanonical))
-                    return new("void*", "void*", x => $"cppm::ptr_to_void({x})");
+                if (pointeeCanonical.kind is CXTypeKind.CXType_Record)
+                {
+                    _ = OpaquePointerOf(pointeeCanonical);
+                    return new(
+                        _opaquePointers[Usr(clang.getTypeDeclaration(pointeeCanonical))].CName + "*",
+                        "void*",
+                        x => $"cppm::ptr_to_void({x})");
+                }
 
                 throw new NotSupportedException($"不支持的指针返回值 {clang.getTypeSpelling(type)}");
             }
@@ -757,17 +834,25 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
         if (canonical.kind is CXTypeKind.CXType_LValueReference)
         {
             CXType pointee = clang.getPointeeType(canonical);
+            CXType pointeeCanonical = clang.getCanonicalType(pointee);
             if (clang.isConstQualifiedType(pointee) is 0
-                && ClassOf(clang.getCanonicalType(pointee)) is null)
+                && ClassOf(pointeeCanonical) is null
+                && pointeeCanonical.kind is not CXTypeKind.CXType_Record)
             {
                 throw new NotSupportedException($"不支持的非 const 引用信号参数 {clang.getTypeSpelling(type)}");
             }
 
-            canonical = clang.getCanonicalType(pointee);
+            canonical = pointeeCanonical;
             if (ClassOf(canonical) is { } referenced)
             {
                 _usedClasses.Add(Usr(referenced.Cursor));
                 return (referenced.CName + "*", "void*", $"cppm::ref_to_void(const_cast<{referenced.CppName}&>({name}))");
+            }
+
+            if (canonical.kind is CXTypeKind.CXType_Record)
+            {
+                OpaquePointerInfo opaque = OpaquePointerOf(canonical);
+                return (opaque.CName + "*", "void*", $"cppm::ref_to_void(const_cast<{opaque.CppName}&>({name}))");
             }
         }
 
@@ -799,6 +884,12 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
 
             if (IsForeignQObject(pointeeCanonical))
                 return ("void*", "void*", $"cppm::ptr_to_void(const_cast<{QObjectSpelling(pointeeCanonical)}*>({name}))");
+
+            if (pointeeCanonical.kind is CXTypeKind.CXType_Record)
+            {
+                OpaquePointerInfo opaque = OpaquePointerOf(pointeeCanonical);
+                return (opaque.CName + "*", "void*", $"cppm::ptr_to_void(const_cast<{opaque.CppName}*>({name}))");
+            }
 
             throw new NotSupportedException($"不支持的指针信号参数 {clang.getTypeSpelling(type)}");
         }
@@ -1026,6 +1117,9 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
         string enums = string.Join("\n\n", _enums.Values
             .OrderBy(e => e.CName, StringComparer.Ordinal)
             .Select(EnumDeclaration));
+        string opaquePointers = string.Join("\n", _opaquePointers.Values
+            .OrderBy(pointer => pointer.CName, StringComparer.Ordinal)
+            .Select(pointer => $"typedef struct {pointer.CName} {{ unsigned char _opaque; }} {pointer.CName};"));
 
         string declarations = string.Join("\n", _headerDeclarations);
 
@@ -1052,6 +1146,8 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
             {{classes}}
 
             {{enums}}
+
+            {{opaquePointers}}
 
             void CPPM_CALL cppm_free_memory(void* pointer);
             {{declarations}}

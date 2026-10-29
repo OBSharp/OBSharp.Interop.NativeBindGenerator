@@ -238,6 +238,18 @@ internal sealed unsafe partial class CExportGenerator
             if (peeled.kind is CXTypeKind.CXType_Record)
             {
                 CXCursor declaration = clang.getTypeDeclaration(peeled);
+                string nativeTypeName = clang.getCursorSpelling(declaration).ToString();
+                if (OpaquePointerTypes.TryGetValue(nativeTypeName, out var opaqueType))
+                {
+                    _typeSources.TryAdd(opaqueType.ManagedName, $$"""
+                        /// <summary>
+                        /// 原生不透明指针类型：<c>{{XmlEscape(opaqueType.NativeName)}}</c>。
+                        /// </summary>
+                        public record struct {{opaqueType.ManagedName}}();
+                        """);
+                    return new(opaqueType.ManagedName + "*");
+                }
+
                 if (!isMarshalled)
                     return new("nint");
 
