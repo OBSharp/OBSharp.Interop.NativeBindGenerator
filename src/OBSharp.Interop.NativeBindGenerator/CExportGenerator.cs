@@ -10,6 +10,9 @@ namespace OBSharp.Interop.NativeBindGenerator;
 /// </summary>
 internal sealed unsafe partial class CExportGenerator(ICExportGeneratorOptions options)
 {
+    internal const string QtArraySuffix = "__cppm_qt_array";
+    internal const string QtCountName = "__cppm_qt_count";
+
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private delegate CXChildVisitResult ChildVisitor(CXCursor cursor, CXCursor parent, void* clientData);
 
@@ -56,6 +59,11 @@ internal sealed unsafe partial class CExportGenerator(ICExportGeneratorOptions o
     /// 临时翻译单元文件名；扩展名决定 clang 按 C 还是 C++ 解析。
     /// </summary>
     internal string TuFileName { get; init; } = "exports.c";
+
+    internal bool UseQtArrays { get; init; }
+
+    internal IReadOnlyDictionary<string, string> OriginalSignatures { get; init; }
+        = new Dictionary<string, string>(StringComparer.Ordinal);
 
     public void Generate()
     {
@@ -237,33 +245,264 @@ internal sealed unsafe partial class CExportGenerator(ICExportGeneratorOptions o
             throw new NotSupportedException("变参函数无法直接 P/Invoke，请在原生侧提供定参包装");
 
         _currentFunction = name;
-        MappedType returnType = MapType(clang.getCursorResultType(function), TypePosition.Return);
+        CXType nativeReturn = clang.getCursorResultType(function);
+        MappedType nativeReturnType = MapType(nativeReturn, TypePosition.Return);
+        MappedType returnType = nativeReturnType;
 
         List<string> parameters = [];
         List<ParameterModel> models = [];
+        Dictionary<int, ParameterModel> modelByNativeIndex = [];
         int count = clang.Cursor_getNumArguments(function);
+        Dictionary<int, QtArrayParameter> qtArrays = [];
+        HashSet<int> hiddenParameters = [];
+        int? qtReturnCountIndex = null;
+        string? qtReturnElementType = null;
+
+        if (UseQtArrays)
+        {
+            for (int i = 0; i + 1 < count; i++)
+            {
+                CXCursor argument = clang.Cursor_getArgument(function, (uint)i);
+                string nativeName = clang.getCursorSpelling(argument).ToString();
+                if (!nativeName.EndsWith(QtArraySuffix, StringComparison.Ordinal))
+                    continue;
+
+                CXCursor countArgument = clang.Cursor_getArgument(function, (uint)(i + 1));
+                string countName = clang.getCursorSpelling(countArgument).ToString();
+                string expectedCountName = nativeName[..^QtArraySuffix.Length] + "__cppm_qt_count";
+                CXType pointer = Peel(clang.getCursorType(argument), out _);
+                _ = Peel(clang.getCursorType(countArgument), out string? countWellKnown);
+                if (countName != expectedCountName
+                    || pointer.kind is not CXTypeKind.CXType_Pointer
+                    || countWellKnown is not "nuint")
+                {
+                    continue;
+                }
+
+                CXType nativeElement = clang.getPointeeType(pointer);
+                string elementType = clang.getCanonicalType(nativeElement).kind is CXTypeKind.CXType_Bool
+                    ? "bool"
+                    : MapType(nativeElement, TypePosition.Nested).Type;
+                string managedName = Identifier(nativeName[..^QtArraySuffix.Length]);
+                qtArrays.Add(i, new(i, i + 1, managedName, elementType));
+                hiddenParameters.Add(i + 1);
+            }
+
+            CXType result = Peel(nativeReturn, out _);
+            if (result.kind is CXTypeKind.CXType_Pointer)
+            {
+                for (int i = 0; i < count; i++)
+                {
+                    CXCursor argument = clang.Cursor_getArgument(function, (uint)i);
+                    if (clang.getCursorSpelling(argument).ToString() != QtCountName)
+                        continue;
+
+                    CXType countPointer = Peel(clang.getCursorType(argument), out _);
+                    if (countPointer.kind is not CXTypeKind.CXType_Pointer)
+                        continue;
+
+                    _ = Peel(clang.getPointeeType(countPointer), out string? countWellKnown);
+                    if (countWellKnown is "nuint")
+                    {
+                        qtReturnCountIndex = i;
+                        CXType nativeElement = clang.getPointeeType(result);
+                        qtReturnElementType = clang.getCanonicalType(nativeElement).kind is CXTypeKind.CXType_Bool
+                            ? "bool"
+                            : MapType(nativeElement, TypePosition.Nested).Type;
+                        nativeReturnType = new(qtReturnElementType + "*");
+                        hiddenParameters.Add(i);
+                        returnType = new($"ReadOnlySpan<{qtReturnElementType}>");
+                        break;
+                    }
+                }
+            }
+        }
+
         for (int i = 0; i < count; i++)
         {
             CXCursor argument = clang.Cursor_getArgument(function, (uint)i);
             MappedType parameter = MapType(clang.getCursorType(argument), TypePosition.Parameter);
             string parameterName = clang.getCursorSpelling(argument).ToString();
             string csName = parameterName.Length is 0 ? $"arg{i}" : Identifier(parameterName);
-            models.Add(new(csName, parameter));
-            parameters.Add($"{parameter.Attribute}{parameter.Modifier}{parameter.Type} {csName}");
+
+            if (qtArrays.TryGetValue(i, out QtArrayParameter? qtArray))
+            {
+                parameters.Add($"{qtArray.ElementType}* {csName}");
+                ParameterModel model = new(qtArray.ManagedName, new($"ReadOnlySpan<{qtArray.ElementType}>"));
+                models.Add(model);
+                modelByNativeIndex.Add(i, model);
+            }
+            else
+            {
+                parameters.Add($"{parameter.Attribute}{parameter.Modifier}{parameter.Type} {csName}");
+                if (!hiddenParameters.Contains(i))
+                {
+                    ParameterModel model = new(csName, parameter);
+                    models.Add(model);
+                    modelByNativeIndex.Add(i, model);
+                }
+            }
         }
 
         _currentFunction = "";
         _models.Add(new(name, returnType, models));
 
-        string attributes = returnType.Attribute.Length is 0
+        string attributes = nativeReturnType.Attribute.Length is 0
             ? ""
-            : $"    [return: {returnType.Attribute.Trim().TrimStart('[').TrimEnd(']')}]\n";
-        return $$"""
+            : $"    [return: {nativeReturnType.Attribute.Trim().TrimStart('[').TrimEnd(']')}]\n";
+        string nativeMethodName = qtArrays.Count is 0
+            && qtReturnCountIndex is null
+            ? Identifier(name)
+            : Identifier(name) + "__Native";
+        string signature = NativeSignature(function, name);
+        string documentation = $$"""
+            /// <summary>
+            /// 原生声明：<c>{{XmlEscape(signature)}}</c>
+            /// </summary>
+            """;
+        string import = $$"""
                 [LibraryImport(LibraryName, EntryPoint = "{{Escape(name)}}")]
                 [UnmanagedCallConv(CallConvs = [typeof({{CallConvType(clang.getFunctionTypeCallingConv(functionType))}})])]
-            {{attributes}}    public static partial {{returnType.Type}} {{Identifier(name)}}({{string.Join(", ", parameters)}});
+            {{attributes}}    internal static partial {{nativeReturnType.Type}} {{nativeMethodName}}({{string.Join(", ", parameters)}});
+            """;
+
+        if (qtArrays.Count is 0
+            && qtReturnCountIndex is null)
+        {
+            return $"{documentation}\n{import}";
+        }
+
+        return $"{import}\n\n{documentation}\n{QtArrayWrapper(
+            name,
+            nativeMethodName,
+            nativeReturnType,
+            count,
+            returnType,
+            models,
+            modelByNativeIndex,
+            hiddenParameters,
+            qtArrays,
+            qtReturnCountIndex,
+            qtReturnElementType)}";
+    }
+
+    private static string QtArrayWrapper(
+        string name,
+        string nativeMethodName,
+        MappedType nativeReturnType,
+        int nativeParameterCount,
+        MappedType returnType,
+        List<ParameterModel> models,
+        Dictionary<int, ParameterModel> modelByNativeIndex,
+        HashSet<int> hiddenParameters,
+        Dictionary<int, QtArrayParameter> arrays,
+        int? returnCountIndex,
+        string? returnElementType)
+    {
+        List<string> declarations = models
+            .Select(parameter => $"{parameter.Type.Modifier}{parameter.Type.Type} {parameter.Name}")
+            .ToList();
+        List<string> arguments = [];
+        List<string> fixedStatements = [];
+        Dictionary<int, string> pinnedNames = [];
+
+        foreach (QtArrayParameter array in arrays.Values)
+        {
+            string pinned = $"_cppmArray{array.ArrayIndex}";
+            pinnedNames.Add(array.ArrayIndex, pinned);
+            fixedStatements.Add($"fixed ({array.ElementType}* {pinned} = {array.ManagedName})");
+        }
+
+        for (int i = 0; i < nativeParameterCount; i++)
+        {
+            if (arrays.TryGetValue(i, out QtArrayParameter? array))
+            {
+                arguments.Add(pinnedNames[array.ArrayIndex]);
+                arguments.Add($"(nuint){array.ManagedName}.Length");
+                i = array.CountIndex;
+                continue;
+            }
+
+            if (returnCountIndex is { } countIndex
+                && i == countIndex)
+            {
+                arguments.Add("&_cppmCount");
+                continue;
+            }
+
+            if (hiddenParameters.Contains(i))
+                continue;
+
+            if (modelByNativeIndex.TryGetValue(i, out ParameterModel? model))
+                arguments.Add(model.Type.Modifier + model.Name);
+        }
+
+        string call = $"{nativeMethodName}({string.Join(", ", arguments)})";
+        string body;
+        if (returnCountIndex is not null)
+        {
+            string elementType = returnElementType!;
+            body = $$"""
+                    {{nativeReturnType.Type}} _cppmResult = {{call}};
+                    try
+                    {
+                        if (_cppmCount is 0)
+                            return ReadOnlySpan<{{elementType}}>.Empty;
+                        if (_cppmResult is null)
+                            throw new InvalidOperationException("原生 QList 返回了空指针和非零长度");
+
+                        {{elementType}}[] copy = new ReadOnlySpan<{{elementType}}>(
+                            _cppmResult,
+                            checked((int)_cppmCount)).ToArray();
+                        return copy;
+                    }
+                    finally
+                    {
+                        cppm_free_memory((nint)_cppmResult);
+                    }
+                """;
+            body = "nuint _cppmCount;\n" + body;
+        }
+        else
+        {
+            body = returnType.Type is "void"
+                ? $"{call};"
+                : $"return {call};";
+        }
+
+        for (int i = fixedStatements.Count - 1; i >= 0; i--)
+            body = $"{fixedStatements[i]}\n{{\n{Indent(body, 4)}\n}}";
+
+        return $$"""
+                public static {{returnType.Type}} {{Identifier(name)}}({{string.Join(", ", declarations)}})
+                {
+            {{Indent(body, 4)}}
+                }
             """;
     }
+
+    private string NativeSignature(CXCursor function, string name)
+    {
+        if (OriginalSignatures.TryGetValue(name, out string? originalSignature))
+            return originalSignature;
+
+        string returnType = clang.getTypeSpelling(clang.getCursorResultType(function)).ToString();
+        int count = clang.Cursor_getNumArguments(function);
+        string parameters = count is 0
+            ? "void"
+            : string.Join(", ", Enumerable.Range(0, count)
+                .Select(index => clang.getTypeSpelling(clang.getCursorType(
+                    clang.Cursor_getArgument(function, (uint)index))).ToString()));
+        return $"{returnType} {name}({parameters})";
+    }
+
+    private static string XmlEscape(string value)
+        => value.Replace("&", "&amp;", StringComparison.Ordinal)
+            .Replace("<", "&lt;", StringComparison.Ordinal)
+            .Replace(">", "&gt;", StringComparison.Ordinal);
+
+    private static string Indent(string value, int spaces)
+        => string.Join("\n", value.Split('\n').Select(line => new string(' ', spaces) + line));
 
     private static string CallConvType(CXCallingConv convention)
         => convention switch
@@ -318,6 +557,7 @@ internal sealed unsafe partial class CExportGenerator(ICExportGeneratorOptions o
 
             #nullable enable
 
+            using System;
             using System.Runtime.CompilerServices;
             using System.Runtime.InteropServices;
             using System.Runtime.InteropServices.Marshalling;

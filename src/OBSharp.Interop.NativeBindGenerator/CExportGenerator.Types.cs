@@ -27,13 +27,16 @@ internal sealed unsafe partial class CExportGenerator
     private sealed record FieldInfo(
         string Name,
         string TypeText,
-        string? FixedCount,
+        string RawType,
         long OffsetBytes,
         long Size,
         long Align);
 
-    private static readonly HashSet<string> FixedBufferTypes =
-        ["bool", "byte", "char", "double", "float", "int", "long", "sbyte", "short", "uint", "ulong", "ushort"];
+    private sealed record QtArrayParameter(
+        int ArrayIndex,
+        int CountIndex,
+        string ManagedName,
+        string ElementType);
 
     private static readonly HashSet<string> Keywords =
     [
@@ -56,6 +59,7 @@ internal sealed unsafe partial class CExportGenerator
     private readonly Dictionary<uint, string> _recordNames = [];
     private readonly Dictionary<uint, string> _enumNames = [];
     private readonly Dictionary<uint, string> _handleNames = [];
+    private readonly Dictionary<uint, string> _handleNativeTypes = [];
     private readonly Dictionary<uint, string> _handleReleases = [];
     private readonly Dictionary<string, uint> _releaseFunctions = [];
     private readonly Dictionary<string, string> _typeSources = [];
@@ -206,6 +210,9 @@ internal sealed unsafe partial class CExportGenerator
             return new("string?", "[MarshalAs(UnmanagedType.LPWStr)] ");
         }
 
+        if (position is TypePosition.Field)
+            return new("nint");
+
         if (pointeeWellKnown is null)
         {
             if (isMarshalled
@@ -231,20 +238,17 @@ internal sealed unsafe partial class CExportGenerator
             if (peeled.kind is CXTypeKind.CXType_Record)
             {
                 CXCursor declaration = clang.getTypeDeclaration(peeled);
-                if (clang.Cursor_isNull(clang.getCursorDefinition(declaration)) is not 0)
+                if (!isMarshalled)
+                    return new("nint");
+
+                uint key = KeyOf(declaration);
+                if (_releaseFunctions.TryGetValue(_currentFunction, out uint releaseKey)
+                    && releaseKey == key)
                 {
-                    if (!isMarshalled)
-                        return new("nint");
-
-                    uint key = KeyOf(declaration);
-                    if (_releaseFunctions.TryGetValue(_currentFunction, out uint releaseKey)
-                        && releaseKey == key)
-                    {
-                        return new("nint");
-                    }
-
-                    return new(HandleName(declaration));
+                    return new("nint");
                 }
+
+                return new(HandleName(declaration));
             }
         }
 
@@ -290,8 +294,15 @@ internal sealed unsafe partial class CExportGenerator
         if (!_handleNames.TryGetValue(key, out string? name))
         {
             string cName = DeclarationName(declaration);
-            name = Pascal(cName);
+            name = Pascal(cName) + (_recordNames.ContainsKey(key) ? "Handle" : "");
+            while (_recordNames.Values.Contains(name, StringComparer.Ordinal)
+                || _handleNames.Values.Contains(name, StringComparer.Ordinal))
+            {
+                name += "Handle";
+            }
+
             _handleNames[key] = name;
+            _handleNativeTypes[key] = clang.getTypeSpelling(clang.getCursorType(declaration)).ToString();
             _owners[name] = (cName, true);
         }
 
@@ -323,9 +334,6 @@ internal sealed unsafe partial class CExportGenerator
         }
 
         CXCursor declaration = clang.getTypeDeclaration(pointee);
-        if (clang.Cursor_isNull(clang.getCursorDefinition(declaration)) is 0)
-            return;
-
         uint key = KeyOf(declaration);
         if (_handleReleases.TryAdd(key, name))
             _releaseFunctions[name] = key;
@@ -339,7 +347,11 @@ internal sealed unsafe partial class CExportGenerator
             string releaseCall = hasRelease
                 ? $"NativeMethods.{Identifier(release!)}(handle);"
                 : "// 头文件中没有识别到释放函数，句柄不拥有原生对象";
+            string rawType = _handleNativeTypes[key];
             _typeSources[name] = $$"""
+                /// <summary>
+                /// 原生类型：<c>{{XmlEscape(rawType)}}</c>。
+                /// </summary>
                 public sealed partial class {{name}} : SafeHandle
                 {
                     public {{name}}() : base(IntPtr.Zero, {{(hasRelease ? "true" : "false")}})
@@ -386,7 +398,11 @@ internal sealed unsafe partial class CExportGenerator
                 return $"    {Identifier(clang.getCursorSpelling(constant).ToString())} = {value},";
             }));
 
+        string rawType = clang.getTypeSpelling(clang.getCursorType(definition)).ToString();
         _typeSources[name] = $$"""
+            /// <summary>
+            /// 原生类型：<c>{{XmlEscape(rawType)}}</c>。
+            /// </summary>
             public enum {{name}} : {{underlying}}
             {
             {{members}}
@@ -447,11 +463,14 @@ internal sealed unsafe partial class CExportGenerator
                 fieldName += "_";
 
             CXType fieldType = clang.getCursorType(field);
-            (string typeText, string? fixedCount) = FieldType(fieldType, name, fieldName);
+            if (Peel(fieldType, out _) is { kind: CXTypeKind.CXType_IncompleteArray })
+                continue;
+
+            string typeText = FieldType(fieldType, name, fieldName);
             fields.Add(new(
                 fieldName,
                 typeText,
-                fixedCount,
+                clang.getTypeSpelling(fieldType).ToString(),
                 clang.Cursor_getOffsetOfField(field) / 8,
                 clang.Type_getSizeOf(fieldType),
                 clang.Type_getAlignOf(fieldType)));
@@ -478,15 +497,20 @@ internal sealed unsafe partial class CExportGenerator
 
         foreach (FieldInfo field in fields)
         {
+            lines.Add("    /// <summary>");
+            lines.Add($"    /// 原生字段类型：<c>{XmlEscape(field.RawType)}</c>。");
+            lines.Add("    /// </summary>");
             if (isExplicit)
                 lines.Add($"    [FieldOffset({field.OffsetBytes})]");
-            lines.Add(field.FixedCount is null
-                ? $"    public {field.TypeText} {field.Name};"
-                : $"    public fixed {field.TypeText} {field.Name}[{field.FixedCount}];");
+            lines.Add($"    public {field.TypeText} {field.Name};");
         }
 
         string body = string.Join("\n", lines);
+        string rawType = clang.getTypeSpelling(clang.getCursorType(definition)).ToString();
         return $$"""
+            /// <summary>
+            /// 原生类型：<c>{{XmlEscape(rawType)}}</c>。
+            /// </summary>
             {{layout}}
             public unsafe partial struct {{name}}
             {
@@ -505,7 +529,7 @@ internal sealed unsafe partial class CExportGenerator
             _ => null,
         };
 
-    private (string TypeText, string? FixedCount) FieldType(CXType type, string owner, string fieldName)
+    private string FieldType(CXType type, string owner, string fieldName)
     {
         CXType shape = Peel(type, out string? wellKnown);
         if (wellKnown is null
@@ -513,21 +537,21 @@ internal sealed unsafe partial class CExportGenerator
         {
             string element = MapType(clang.getArrayElementType(shape), TypePosition.Field).Type;
             long count = clang.getNumElements(shape);
-            if (FixedBufferTypes.Contains(element))
-                return (element, count.ToString(CultureInfo.InvariantCulture));
+            if (count is <= 0 or > int.MaxValue)
+                throw new NotSupportedException($"定长数组 {fieldName} 的长度 {count} 无法映射到 InlineArray");
 
             string bufferName = $"{owner}_{fieldName.TrimStart('@')}_Buffer";
             _typeSources[bufferName] = $$"""
-                [InlineArray({{count}})]
-                public unsafe struct {{bufferName}}
+                [InlineArray({{count.ToString(CultureInfo.InvariantCulture)}})]
+                public struct {{bufferName}}
                 {
                     private {{element}} _element0;
                 }
                 """;
-            return (bufferName, null);
+            return bufferName;
         }
 
-        return (MapType(type, TypePosition.Field).Type, null);
+        return MapType(type, TypePosition.Field).Type;
     }
 
     /// <summary>

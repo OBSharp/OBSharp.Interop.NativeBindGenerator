@@ -95,6 +95,16 @@ internal static class CppMarshaller
                 return (items && count) ? std::vector<T>(items, items + count) : std::vector<T>();
             }
 
+            template <class List, class T>
+            inline List to_list(const T* items, size_t count)
+            {
+                List result;
+                result.reserve(count);
+                for (size_t i = 0; items && i < count; ++i)
+                    result.append(items[i]);
+                return result;
+            }
+
             // 返回由 allocate 分配的拷贝，须通过 cppm_free_memory 释放
             template <class V>
             inline auto to_c_array(const V& values, size_t* count)

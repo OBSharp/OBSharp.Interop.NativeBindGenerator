@@ -21,10 +21,18 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
 
     private sealed record ParamPlan(List<Param> Params, string Argument);
 
-    private sealed record ReturnPlan(string H, string C, Func<string, string> Wrap, bool NeedsCount = false);
+    private sealed record ReturnPlan(
+        string H,
+        string C,
+        Func<string, string> Wrap,
+        bool NeedsCount = false,
+        string? CountParameterName = null);
 
     private const string SelfName = "self";
     private const string CountName = "cppm_count";
+    private const string QtCountName = CExportGenerator.QtCountName;
+    private const string QtArraySuffix = CExportGenerator.QtArraySuffix;
+    private const string QtArrayCountSuffix = "__cppm_qt_count";
 
     private static readonly HashSet<string> WellKnownTypes =
     [
@@ -39,6 +47,7 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
     private readonly List<string> _headerDeclarations = [];
     private readonly List<string> _sourceDefinitions = [];
     private readonly List<string> _sourceTypedefs = [];
+    private readonly Dictionary<string, string> _originalSignatures = new(StringComparer.Ordinal);
     private HashSet<string> _headers = [];
     private string _headerText = "";
 
@@ -124,6 +133,8 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
         new CExportGenerator(options)
         {
             TuFileName = "exports.cpp",
+            UseQtArrays = options.Qt,
+            OriginalSignatures = _originalSignatures,
         }.Generate();
     }
 
@@ -292,6 +303,14 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
             && clang.Type_getNumTemplateArguments(canonical) > 0;
     }
 
+    private static bool IsQtList(CXType canonical)
+    {
+        string spelling = clang.getTypeSpelling(canonical).ToString();
+        return (spelling.StartsWith("QList<", StringComparison.Ordinal)
+                || spelling.StartsWith("::QList<", StringComparison.Ordinal))
+            && clang.Type_getNumTemplateArguments(canonical) > 0;
+    }
+
     private ClassInfo? ClassOf(CXType canonical)
         => canonical.kind is CXTypeKind.CXType_Record
             && _classes.TryGetValue(Usr(clang.getTypeDeclaration(canonical)), out ClassInfo? info)
@@ -366,8 +385,22 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
 
     private ParamPlan ConvertValue(CXType canonical, string name)
     {
-        if (options.Qt && IsQString(canonical))
+        if (options.Qt
+            && IsQString(canonical))
             return new([new("const char*", "const char*", name)], $"QString::fromUtf8({name})");
+
+        if (options.Qt
+            && IsQtList(canonical))
+        {
+            string element = ArithName(clang.Type_getTemplateArgumentAsType(canonical, 0)) is { } arith
+                ? arith
+                : throw new NotSupportedException("QList 目前仅支持 C 基本类型元素的转换");
+            string arrayName = name + QtArraySuffix;
+            string countName = name + QtArrayCountSuffix;
+            return new(
+                [new($"const {element}*", $"const {element}*", arrayName), new("size_t", "size_t", countName)],
+                $"cppm::to_list<QList<{element}>>({arrayName}, {countName})");
+        }
 
         if (IsStdStringView(canonical))
             return new([new("const char*", "const char*", name)], $"cppm::from_c_view({name})");
@@ -449,7 +482,8 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
             }
         }
 
-        if (options.Qt && IsQString(canonical))
+        if (options.Qt
+            && IsQString(canonical))
             return new("const char*", "char*", x => $"cppm::dup_string(({x}).toUtf8().constData())");
 
         if (IsStdString(canonical)
@@ -458,12 +492,31 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
             return new("const char*", "char*", x => $"cppm::dup_string({x})");
         }
 
+        if (options.Qt
+            && IsQtList(canonical))
+        {
+            string element = ArithName(clang.Type_getTemplateArgumentAsType(canonical, 0)) is { } arith
+                ? arith
+                : throw new NotSupportedException("QList 目前仅支持 C 基本类型元素的转换");
+            return new(
+                $"{element}*",
+                $"{element}*",
+                x => $"cppm::to_c_array({x}, {QtCountName})",
+                NeedsCount: true,
+                CountParameterName: QtCountName);
+        }
+
         if (IsStdVector(canonical))
         {
             string element = ArithName(clang.Type_getTemplateArgumentAsType(canonical, 0)) is { } arith and not "bool"
                 ? arith
                 : throw new NotSupportedException("仅支持元素为 C 基本类型的 std::vector");
-            return new($"{element}*", $"{element}*", x => $"cppm::to_c_array({x}, {CountName})", NeedsCount: true);
+            return new(
+                $"{element}*",
+                $"{element}*",
+                x => $"cppm::to_c_array({x}, {CountName})",
+                NeedsCount: true,
+                CountParameterName: CountName);
         }
 
         if (ClassOf(canonical) is { } owned)
@@ -498,7 +551,7 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
         if (name.Length is 0)
             name = $"arg{index}";
 
-        while (name is SelfName or CountName
+        while (name is SelfName or CountName or QtCountName
             || !used.Add(name))
         {
             name += "_";
@@ -834,7 +887,14 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
         for (int i = 0; i < count; i++)
         {
             CXCursor argument = clang.Cursor_getArgument(function, (uint)i);
-            ParamPlan plan = ConvertParameter(clang.getCursorType(argument), ParameterName(argument, i, used));
+            string name = ParameterName(argument, i, used);
+            ParamPlan plan = ConvertParameter(clang.getCursorType(argument), name);
+            foreach (Param parameter in plan.Params.Where(parameter => parameter.Name != name))
+            {
+                if (!used.Add(parameter.Name))
+                    throw new NotSupportedException($"参数名 {parameter.Name} 与 QList 数组转换参数冲突");
+            }
+
             parameters.AddRange(plan.Params);
             arguments.Add(plan.Argument);
         }
@@ -874,7 +934,21 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
             UniqueName($"{info.CName}_{name.Underscore()}"),
             returnPlan,
             parameters,
-            $"{target}({string.Join(", ", arguments)})");
+            $"{target}({string.Join(", ", arguments)})",
+            originalSignature: OriginalMethodSignature(info, method, name));
+    }
+
+    private static string OriginalMethodSignature(ClassInfo info, CXCursor method, string name)
+    {
+        string returnType = clang.getTypeSpelling(clang.getCursorResultType(method)).ToString();
+        int count = clang.Cursor_getNumArguments(method);
+        string parameters = count is 0
+            ? ""
+            : string.Join(", ", Enumerable.Range(0, count)
+                .Select(index => clang.getTypeSpelling(clang.getCursorType(
+                    clang.Cursor_getArgument(method, (uint)index))).ToString()));
+        string isConst = clang.CXXMethod_isConst(method) is not 0 ? " const" : "";
+        return $"{returnType} {info.CppName}::{name}({parameters}){isConst}";
     }
 
     private void BindFieldGetter(ClassInfo info, string field, CXType type, string snake)
@@ -899,11 +973,20 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
             isStatement: true);
     }
 
-    private void Add(string cName, ReturnPlan returnPlan, List<Param> parameters, string expression, bool isStatement = false)
+    private void Add(
+        string cName,
+        ReturnPlan returnPlan,
+        List<Param> parameters,
+        string expression,
+        bool isStatement = false,
+        string? originalSignature = null)
     {
+        if (originalSignature is not null)
+            _originalSignatures.Add(cName, originalSignature);
+
         List<Param> all = [.. parameters];
         if (returnPlan.NeedsCount)
-            all.Add(new("size_t*", "size_t*", CountName));
+            all.Add(new("size_t*", "size_t*", returnPlan.CountParameterName!));
 
         string hParameters = all.Count is 0
             ? "void"
