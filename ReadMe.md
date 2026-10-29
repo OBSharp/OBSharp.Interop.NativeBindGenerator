@@ -3,6 +3,7 @@
 OBSharp.Interop.NativeBindGenerator 是一个基于 libclang 的命令行工具，可从 C 头文件中的函数和类型声明生成 C# P/Invoke 绑定。它也可以为 C++ 类生成 C 式导出包装，再为这些导出生成 C# 绑定。
 
 生成的托管函数使用 .NET `LibraryImport`，支持根据声明生成调用约定、参数和返回值类型、结构体布局及不透明句柄。
+生成的 `LibraryImport` 方法为 `internal`；完整的 C/C++ 声明会记录在生成代码的 XML 文档注释中。
 
 ## 环境要求
 
@@ -141,12 +142,14 @@ NativeBindGenerator \
 - `const char*` 参数和返回值默认按 UTF-8 字符串处理；可分别通过 `--string-marshaller` 和 `--return-string-marshaller` 指定自定义 marshaller。
 - `bool` 参数和返回值默认使用 1 字节封送；`--four-byte-boolean` 可切换为 4 字节封送。
 - 函数指针生成为 `delegate* unmanaged`；数组以指针形式表示。
-- 完整定义的结构体、联合体和枚举会生成对应 C# 类型。
-- 不透明结构体指针可生成为 `SafeHandle`。符合常见释放函数形式的声明（例如接收单个不透明指针、返回 `void` 且函数名包含 `destroy`、`free`、`release`、`close` 或 `delete`）可用于关联句柄释放操作。
+- 完整定义的结构体、联合体和枚举会生成对应 C# 类型；结构体中的定长数组使用 `InlineArray`。
+- 对象及不透明结构体指针可生成为 `SafeHandle`。符合常见释放函数形式的声明（例如接收单个不透明指针、返回 `void` 且函数名包含 `destroy`、`free`、`release`、`close` 或 `delete`）可用于关联句柄释放操作。
 
 ### C++ 转发
 
 `--cpp-redirect` 会为头文件中的可处理 C++ 类和枚举生成 C 式导出。该模式支持常见标量、枚举、类对象和指针，以及部分字符串和 `std::vector` 转换；不支持的声明会被跳过或报告。具体可处理的类型取决于声明形式以及传入的 Clang 参数。
+
+启用 `--qt` 时，支持元素为 C 基本类型的 `QList<T>`；托管 API 使用 `ReadOnlySpan<T>`，native 边界使用 `T*` 与 `size_t`，并在 C++ 包装中转换为 `QList<T>`。返回值会复制到托管内存后以只读跨度返回。
 
 ## 注意事项
 
