@@ -361,7 +361,7 @@ internal sealed unsafe partial class CExportGenerator(ICExportGeneratorOptions o
             /// </summary>
             """;
         string import = $$"""
-                [LibraryImport(LibraryName, EntryPoint = "{{Escape(name)}}")]
+                [LibraryImport("{{Escape(options.LibraryName)}}", EntryPoint = "{{Escape(name)}}")]
                 [UnmanagedCallConv(CallConvs = [typeof({{CallConvType(clang.getFunctionTypeCallingConv(functionType))}})])]
             {{attributes}}    internal static partial {{nativeReturnType.Type}} {{nativeMethodName}}({{string.Join(", ", parameters)}});
             """;
@@ -527,8 +527,6 @@ internal sealed unsafe partial class CExportGenerator(ICExportGeneratorOptions o
             {{Header()}}
             public static unsafe partial class NativeMethods
             {
-                private const string LibraryName = "{{Escape(options.LibraryName)}}";
-
             {{methodSources}}
             }
 
