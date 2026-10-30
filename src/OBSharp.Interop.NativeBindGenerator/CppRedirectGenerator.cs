@@ -17,7 +17,12 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
 
     private sealed record EnumInfo(CXCursor Cursor, string CName, string CppName);
 
-    private sealed record OpaquePointerInfo(string CName, string CppName, string ManagedName);
+    private sealed record OpaquePointerInfo(
+        string CName,
+        string CppName,
+        string ManagedType,
+        string DeclarationKey,
+        string Declaration);
 
     private sealed record Param(string H, string C, string Name);
 
@@ -46,6 +51,7 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
     private readonly Dictionary<string, EnumInfo> _enums = [];
     private readonly Dictionary<string, OpaquePointerInfo> _opaquePointers = [];
     private readonly HashSet<string> _opaqueManagedNames = [];
+    private readonly Dictionary<string, string> _opaqueTemplateNames = [];
     private readonly HashSet<string> _usedClasses = [];
     private readonly HashSet<string> _cNames = [];
     private readonly List<string> _headerDeclarations = [];
@@ -141,7 +147,7 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
             OriginalSignatures = _originalSignatures,
             OpaquePointerTypes = _opaquePointers.Values.ToDictionary(
                 pointer => pointer.CName,
-                pointer => (pointer.ManagedName, pointer.CppName),
+                pointer => (pointer.ManagedType, pointer.CppName, pointer.DeclarationKey, pointer.Declaration),
                 StringComparer.Ordinal),
         }.Generate();
     }
@@ -314,6 +320,19 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
     private static bool IsQtList(CXType canonical)
     {
         string spelling = clang.getTypeSpelling(canonical).ToString();
+        while (spelling.StartsWith("const ", StringComparison.Ordinal)
+            || spelling.StartsWith("volatile ", StringComparison.Ordinal))
+        {
+            int qualifierLength = spelling.StartsWith("const ", StringComparison.Ordinal) ? 6 : 9;
+            spelling = spelling[qualifierLength..].TrimStart();
+        }
+
+        if (spelling.StartsWith("class ", StringComparison.Ordinal)
+            || spelling.StartsWith("struct ", StringComparison.Ordinal))
+        {
+            spelling = spelling[(spelling.IndexOf(' ') + 1)..];
+        }
+
         return (spelling.StartsWith("QList<", StringComparison.Ordinal)
                 || spelling.StartsWith("::QList<", StringComparison.Ordinal))
             && clang.Type_getNumTemplateArguments(canonical) > 0;
@@ -342,14 +361,52 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
             .Replace("const ", "", StringComparison.Ordinal)
             .Replace("volatile ", "", StringComparison.Ordinal)
             .Trim();
-        int namespaceSeparator = cppName.LastIndexOf("::", StringComparison.Ordinal);
-        string shortName = namespaceSeparator is -1
-            ? cppName
-            : cppName[(namespaceSeparator + 2)..];
-        if (shortName.Length is 0)
-            throw new NotSupportedException($"无法为不透明指针类型 {cppName} 生成名称");
+        int templateStart = cppName.IndexOf('<');
+        if (templateStart is not -1)
+        {
+            string cppTemplateName = cppName[..templateStart].Trim();
+            string managedTemplateName = OpaqueTemplateName(cppTemplateName);
+            int argumentCount = clang.Type_getNumTemplateArguments(canonical);
+            List<string> managedArguments = [];
+            if (argumentCount > 0)
+            {
+                for (int i = 0; i < argumentCount; i++)
+                    managedArguments.Add(OpaqueTemplateArgument(clang.Type_getTemplateArgumentAsType(canonical, (uint)i)));
+            }
+            else
+            {
+                managedArguments.AddRange(TemplateArguments(cppName).Select(OpaqueTemplateArgument));
+            }
 
-        string managedName = shortName;
+            if (managedArguments.Count is 0)
+                managedArguments.Add("nint");
+
+            int managedArgumentCount = managedArguments.Count;
+            string managedType = $"{managedTemplateName}<{string.Join(", ", managedArguments)}>";
+            string typeParameters = managedArgumentCount is 1
+                ? "T"
+                : string.Join(", ", Enumerable.Range(1, managedArgumentCount).Select(index => $"T{index}"));
+            string declarationKey = $"{managedTemplateName}<{typeParameters}>";
+            string constraints = string.Join(" ", Enumerable.Range(1, managedArgumentCount)
+                .Select(index => $"where {(managedArgumentCount is 1 ? "T" : $"T{index}")} : unmanaged"));
+            string declarationSource = $"public partial struct {managedTemplateName}<{typeParameters}> {constraints} {{ }}";
+            string templateIdentifier = NativeIdentifier(cppTemplateName);
+            OpaquePointerInfo genericPointer = new(
+                UniqueName("nbg_opaque_" + templateIdentifier),
+                cppName,
+                managedType,
+                declarationKey,
+                declarationSource);
+            _opaquePointers.Add(usr, genericPointer);
+            return genericPointer;
+        }
+
+        string qualifiedName = QualifiedName(declaration).Cpp ?? Spelling(declaration);
+        string shortName = Spelling(declaration);
+        if (shortName.Length is 0)
+            shortName = cppName;
+
+        string managedName = ManagedIdentifier(qualifiedName);
         while (_classes.Values.Any(type => type.CName == managedName)
             || _enums.Values.Any(type => type.CName == managedName)
             || !_opaqueManagedNames.Add(managedName))
@@ -357,15 +414,155 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
             managedName += "Opaque";
         }
 
-        string identifier = new(shortName.Select(character =>
-            char.IsLetterOrDigit(character) || character is '_' ? character : '_').ToArray());
+        string identifier = NativeIdentifier(shortName);
         OpaquePointerInfo pointer = new(
             UniqueName("nbg_opaque_" + identifier),
             cppName,
-            managedName);
+            managedName,
+            managedName,
+            $"public record struct {managedName}();");
         _opaquePointers.Add(usr, pointer);
         return pointer;
     }
+
+    private static List<string> TemplateArguments(string cppType)
+    {
+        int start = cppType.IndexOf('<');
+        int end = cppType.LastIndexOf('>');
+        if (start is -1 || end <= start)
+            return [];
+
+        List<string> arguments = [];
+        int depth = 0;
+        int argumentStart = start + 1;
+        for (int i = start + 1; i < end; i++)
+        {
+            switch (cppType[i])
+            {
+                case '<':
+                    depth++;
+                    break;
+                case '>':
+                    depth--;
+                    break;
+                case ',' when depth is 0:
+                    arguments.Add(cppType[argumentStart..i].Trim());
+                    argumentStart = i + 1;
+                    break;
+            }
+        }
+
+        arguments.Add(cppType[argumentStart..end].Trim());
+        return arguments;
+    }
+
+    private string OpaqueTemplateName(string cppName)
+    {
+        if (_opaqueTemplateNames.TryGetValue(cppName, out string? existing))
+            return existing;
+
+        string managedName = ManagedIdentifier(cppName);
+        while (_classes.Values.Any(type => type.CName == managedName)
+            || _enums.Values.Any(type => type.CName == managedName)
+            || _opaqueManagedNames.Contains(managedName))
+        {
+            managedName += "Opaque";
+        }
+
+        _opaqueManagedNames.Add(managedName);
+        _opaqueTemplateNames.Add(cppName, managedName);
+        return managedName;
+    }
+
+    private string OpaqueTemplateArgument(CXType argument)
+    {
+        CXType canonical = clang.getCanonicalType(argument);
+        if (canonical.kind is CXTypeKind.CXType_Pointer
+            or CXTypeKind.CXType_FunctionProto
+            or CXTypeKind.CXType_FunctionNoProto)
+        {
+            return "nint";
+        }
+
+        if (ClassOf(canonical) is not null)
+            return "nint";
+
+        if (EnumOf(canonical) is { } enumInfo)
+            return enumInfo.CName;
+
+        if (canonical.kind is CXTypeKind.CXType_Record)
+            return "nint";
+
+        if (ArithName(canonical) is { } arith)
+        {
+            return arith switch
+            {
+                "bool" => "bool",
+                "char" or "unsigned char" => "byte",
+                "signed char" => "sbyte",
+                "short" => "short",
+                "unsigned short" => "ushort",
+                "int" => "int",
+                "unsigned int" => "uint",
+                "long" => "CLong",
+                "unsigned long" => "CULong",
+                "long long" => "long",
+                "unsigned long long" => "ulong",
+                "float" => "float",
+                "double" => "double",
+                _ => "nint",
+            };
+        }
+
+        return "nint";
+    }
+
+    private static string OpaqueTemplateArgument(string argument)
+    {
+        string normalized = argument
+            .Replace("const ", "", StringComparison.Ordinal)
+            .Replace("volatile ", "", StringComparison.Ordinal)
+            .Trim();
+        if (normalized.Contains('*')
+            || normalized.Contains('&')
+            || normalized.Contains('('))
+        {
+            return "nint";
+        }
+
+        return normalized switch
+        {
+            "bool" => "bool",
+            "char" or "unsigned char" => "byte",
+            "signed char" => "sbyte",
+            "short" => "short",
+            "unsigned short" => "ushort",
+            "int" => "int",
+            "unsigned int" => "uint",
+            "long" => "CLong",
+            "unsigned long" => "CULong",
+            "long long" => "long",
+            "unsigned long long" => "ulong",
+            "float" => "float",
+            "double" => "double",
+            _ => "nint",
+        };
+    }
+
+    private static string ManagedIdentifier(string qualifiedName)
+    {
+        string identifier = new(qualifiedName
+            .TrimStart(':')
+            .Select(character => char.IsLetterOrDigit(character) || character is '_' ? character : '_')
+            .ToArray());
+        return identifier.Length is 0 || char.IsDigit(identifier[0])
+            ? "_" + identifier
+            : identifier;
+    }
+
+    private static string NativeIdentifier(string name)
+        => new(name.Select(character =>
+            char.IsLetterOrDigit(character) || character is '_' ? character : '_').ToArray());
 
     private ParamPlan ConvertParameter(CXType type, string name)
     {
@@ -381,6 +578,9 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
                 CXType pointeeCanonical = clang.getCanonicalType(pointee);
                 if (clang.isConstQualifiedType(pointee) is not 0)
                 {
+                    if (options.Qt && IsQtList(pointeeCanonical))
+                        return ConvertValue(pointeeCanonical, name);
+
                     if (pointeeCanonical.kind is CXTypeKind.CXType_Record
                         && ClassOf(pointeeCanonical) is null)
                     {
@@ -390,7 +590,7 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
                             $"*static_cast<const {opaque.CppName}*>({name})");
                     }
 
-                    return ConvertValue(pointee, name);
+                    return ConvertValue(pointeeCanonical, name);
                 }
 
                 if (ClassOf(pointeeCanonical) is { } info)
@@ -440,7 +640,10 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
                         $"static_cast<{qualifier}{opaque.CppName}*>({name})");
                 }
 
-                throw new NotSupportedException($"不支持的指针参数 {clang.getTypeSpelling(type)}");
+                string pointerType = clang.getTypeSpelling(canonical).ToString();
+                return new(
+                    [new("void*", "void*", name)],
+                    $"reinterpret_cast<{pointerType}>({name})");
             }
 
             default:
@@ -457,14 +660,32 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
         if (options.Qt
             && IsQtList(canonical))
         {
-            string element = ArithName(clang.Type_getTemplateArgumentAsType(canonical, 0)) is { } arith
-                ? arith
-                : throw new NotSupportedException("QList 目前仅支持 C 基本类型元素的转换");
+            CXType elementType = clang.Type_getTemplateArgumentAsType(canonical, 0);
+            string element;
+            string bridgeElement;
+            string arrayExpression;
+            if (ArithName(elementType) is { } arith)
+            {
+                element = arith;
+                bridgeElement = arith;
+                arrayExpression = name + QtArraySuffix;
+            }
+            else if (clang.getCanonicalType(elementType).kind is CXTypeKind.CXType_Pointer)
+            {
+                element = clang.getTypeSpelling(elementType).ToString();
+                bridgeElement = "intptr_t";
+                arrayExpression = $"reinterpret_cast<{element} const*>({name}{QtArraySuffix})";
+            }
+            else
+            {
+                throw new NotSupportedException("QList 元素类型暂不支持 Span 转换");
+            }
+
             string arrayName = name + QtArraySuffix;
             string countName = name + QtArrayCountSuffix;
             return new(
-                [new($"const {element}*", $"const {element}*", arrayName), new("size_t", "size_t", countName)],
-                $"cppm::to_list<QList<{element}>>({arrayName}, {countName})");
+                [new($"const {bridgeElement}*", $"const {bridgeElement}*", arrayName), new("size_t", "size_t", countName)],
+                $"cppm::to_list<QList<{element}>>({arrayExpression}, {countName})");
         }
 
         if (IsStdStringView(canonical))
@@ -555,7 +776,12 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
                         x => $"cppm::ptr_to_void({x})");
                 }
 
-                throw new NotSupportedException($"不支持的指针返回值 {clang.getTypeSpelling(type)}");
+                return new(
+                    "void*",
+                    "void*",
+                    pointeeCanonical.kind is CXTypeKind.CXType_FunctionProto or CXTypeKind.CXType_FunctionNoProto
+                        ? x => $"reinterpret_cast<void*>({x})"
+                        : x => $"cppm::ptr_to_void({x})");
             }
         }
 
@@ -572,15 +798,28 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
         if (options.Qt
             && IsQtList(canonical))
         {
-            string element = ArithName(clang.Type_getTemplateArgumentAsType(canonical, 0)) is { } arith
-                ? arith
-                : throw new NotSupportedException("QList 目前仅支持 C 基本类型元素的转换");
-            return new(
-                $"{element}*",
-                $"{element}*",
-                x => $"cppm::to_c_array({x}, {QtCountName})",
-                NeedsCount: true,
-                CountParameterName: QtCountName);
+            CXType elementType = clang.Type_getTemplateArgumentAsType(canonical, 0);
+            if (ArithName(elementType) is { } arith)
+            {
+                return new(
+                    $"{arith}*",
+                    $"{arith}*",
+                    x => $"cppm::to_c_array({x}, {QtCountName})",
+                    NeedsCount: true,
+                    CountParameterName: QtCountName);
+            }
+
+            if (clang.getCanonicalType(elementType).kind is CXTypeKind.CXType_Pointer)
+            {
+                return new(
+                    "intptr_t*",
+                    "intptr_t*",
+                    x => $"reinterpret_cast<intptr_t*>(cppm::to_c_array({x}, {QtCountName}))",
+                    NeedsCount: true,
+                    CountParameterName: QtCountName);
+            }
+
+            throw new NotSupportedException("QList 元素类型暂不支持 Span 转换");
         }
 
         if (IsStdVector(canonical))
@@ -891,7 +1130,10 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
                 return (opaque.CName + "*", "void*", $"cppm::ptr_to_void(const_cast<{opaque.CppName}*>({name}))");
             }
 
-            throw new NotSupportedException($"不支持的指针信号参数 {clang.getTypeSpelling(type)}");
+            return (
+                qualifier + "void*",
+                qualifier + "void*",
+                $"reinterpret_cast<{qualifier}void*>({name})");
         }
 
         if (EnumOf(canonical) is { } enumInfo)
