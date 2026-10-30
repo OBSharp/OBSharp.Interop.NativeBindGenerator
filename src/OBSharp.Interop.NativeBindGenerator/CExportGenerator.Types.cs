@@ -241,13 +241,13 @@ internal sealed unsafe partial class CExportGenerator
                 string nativeTypeName = clang.getCursorSpelling(declaration).ToString();
                 if (OpaquePointerTypes.TryGetValue(nativeTypeName, out var opaqueType))
                 {
-                    _typeSources.TryAdd(opaqueType.ManagedName, $$"""
+                    _typeSources.TryAdd(opaqueType.DeclarationKey, $$"""
                         /// <summary>
                         /// 原生不透明指针类型：<c>{{XmlEscape(opaqueType.NativeName)}}</c>。
                         /// </summary>
-                        public record struct {{opaqueType.ManagedName}}();
+                        {{opaqueType.Declaration}}
                         """);
-                    return new(opaqueType.ManagedName + "*");
+                    return new(opaqueType.ManagedType + "*");
                 }
 
                 if (!isMarshalled)

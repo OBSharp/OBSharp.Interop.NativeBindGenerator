@@ -65,8 +65,8 @@ internal sealed unsafe partial class CExportGenerator(ICExportGeneratorOptions o
     internal IReadOnlyDictionary<string, string> OriginalSignatures { get; init; }
         = new Dictionary<string, string>(StringComparer.Ordinal);
 
-    internal IReadOnlyDictionary<string, (string ManagedName, string NativeName)> OpaquePointerTypes { get; init; }
-        = new Dictionary<string, (string ManagedName, string NativeName)>(StringComparer.Ordinal);
+    internal IReadOnlyDictionary<string, (string ManagedType, string NativeName, string DeclarationKey, string Declaration)> OpaquePointerTypes { get; init; }
+        = new Dictionary<string, (string ManagedType, string NativeName, string DeclarationKey, string Declaration)>(StringComparer.Ordinal);
 
     public void Generate()
     {
