@@ -1,10 +1,15 @@
 workflow: GitHubFlow/v1
-assembly-versioning-scheme: MajorMinorPatchTag
-assembly-file-versioning-scheme: MajorMinorPatchTag
+tag-prefix: "[vV]?"
+assembly-file-versioning-format: "{Major}.{Minor}.{Patch}.{CommitsSinceVersionSource}"
+assembly-informational-format: "{SemVer}+{CommitsSinceVersionSource}"
 branches:
   main:
-    label: 'build'
+    label: "build"
+    increment: Patch
+    prevent-increment:
+      when-current-commit-tagged: true
   feature:
     regex: ^feat(ures?)?[\/-](?<BranchName>.+)
+    label: "{BranchName}"
   pull-request:
     label: pr{Number}
