@@ -41,6 +41,15 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
     private const string QtArraySuffix = CExportGenerator.QtArraySuffix;
     private const string QtArrayCountSuffix = "__cppm_qt_count";
 
+    private string FreeMemoryFunctionName
+        => NativeIdentifier(options.NativeName) + "_cppm_free_memory";
+
+    private string ConnectionTypeName
+        => NativeIdentifier(options.NativeName) + "_cppm_qt_connection";
+
+    private string ConnectionDestroyFunctionName
+        => NativeIdentifier(options.NativeName) + "_cppm_qt_connection_destroy";
+
     private static readonly HashSet<string> WellKnownTypes =
     [
         "size_t", "ptrdiff_t", "ssize_t", "intptr_t", "uintptr_t", "intmax_t", "uintmax_t",
@@ -145,6 +154,7 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
             TuFileName = "exports.cpp",
             UseQtArrays = options.Qt,
             OriginalSignatures = _originalSignatures,
+            FreeMemoryFunctionName = FreeMemoryFunctionName,
             OpaquePointerTypes = _opaquePointers.Values.ToDictionary(
                 pointer => pointer.CName,
                 pointer => (pointer.ManagedType, pointer.CppName, pointer.DeclarationKey, pointer.Declaration),
@@ -166,8 +176,17 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
     }
 
     private static bool IsPublic(CXCursor cursor)
-        => clang.getCXXAccessSpecifier(cursor) is CX_CXXAccessSpecifier.CX_CXXPublic
-            or CX_CXXAccessSpecifier.CX_CXXInvalidAccessSpecifier;
+    {
+        CX_CXXAccessSpecifier access = clang.getCXXAccessSpecifier(cursor);
+        if (access is CX_CXXAccessSpecifier.CX_CXXPublic)
+            return true;
+        if (access is not CX_CXXAccessSpecifier.CX_CXXInvalidAccessSpecifier)
+            return false;
+
+        CXCursor parent = clang.getCursorSemanticParent(cursor);
+        return clang.getCursorKind(parent) is CXCursorKind.CXCursor_StructDecl
+            or CXCursorKind.CXCursor_UnionDecl;
+    }
 
     private static string Spelling(CXCursor cursor)
         => clang.getCursorSpelling(cursor).ToString();
@@ -201,7 +220,10 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
                 case CXCursorKind.CXCursor_ClassDecl:
                 case CXCursorKind.CXCursor_StructDecl:
                     if (clang.isCursorDefinition(cursor) is 0
-                        || !IsInHeaders(cursor))
+                        || !IsInHeaders(cursor)
+                        || HasTemplateArguments(cursor)
+                        || !IsVisibleNestedType(cursor)
+                        || !IsQtClassBindable(cursor))
                     {
                         break;
                     }
@@ -220,6 +242,7 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
                     if (clang.isCursorDefinition(cursor) is not 0
                         && IsInHeaders(cursor)
                         && !IsAnonymous(cursor)
+                        && IsVisibleNestedType(cursor)
                         && QualifiedName(cursor) is var (enumC, enumCpp)
                         && enumC is not null)
                     {
@@ -229,6 +252,63 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
                     break;
             }
         }
+    }
+
+    private static bool IsVisibleNestedType(CXCursor cursor)
+    {
+        CXCursor parent = clang.getCursorSemanticParent(cursor);
+        CXCursorKind parentKind = clang.getCursorKind(parent);
+        return parentKind is not (CXCursorKind.CXCursor_ClassDecl or CXCursorKind.CXCursor_StructDecl)
+            || IsPublic(cursor);
+    }
+
+    private bool IsQtClassBindable(CXCursor cursor)
+    {
+        if (!options.Qt)
+            return true;
+
+        List<CXCursor> members = CExportGenerator.ChildrenOf(cursor);
+        if (HasDllImportOrExport(cursor)
+            || members.Any(HasDllImportOrExport))
+        {
+            return true;
+        }
+
+        return members
+            .Where(member => clang.getCursorKind(member) is CXCursorKind.CXCursor_CXXMethod
+                or CXCursorKind.CXCursor_Constructor
+                or CXCursorKind.CXCursor_Destructor)
+            .All(member => clang.Cursor_isFunctionInlined(member) is not 0);
+    }
+
+    private bool IsQtMemberBindable(CXCursor member)
+    {
+        if (!options.Qt)
+            return true;
+
+        CXCursor owner = clang.getCursorSemanticParent(member);
+        bool isImported = HasDllImportOrExport(owner)
+            || HasDllImportOrExport(member);
+        if (isImported
+            && clang.getCursorKind(member) is CXCursorKind.CXCursor_Constructor
+            && clang.Cursor_isFunctionInlined(member) is not 0)
+        {
+            return false;
+        }
+
+        return isImported
+            || clang.Cursor_isFunctionInlined(member) is not 0;
+    }
+
+    private static bool HasDllImportOrExport(CXCursor cursor)
+        => CExportGenerator.ChildrenOf(cursor).Any(child =>
+            clang.getCursorKind(child) is CXCursorKind.CXCursor_DLLImport
+                or CXCursorKind.CXCursor_DLLExport);
+
+    private static bool HasTemplateArguments(CXCursor cursor)
+    {
+        CXType type = clang.getCanonicalType(clang.getCursorType(cursor));
+        return clang.Type_getNumTemplateArguments(type) > 0;
     }
 
     // 模板与匿名命名空间中的类型无法稳定导出，返回 (null, null)
@@ -263,6 +343,16 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
         }
 
         return (string.Join('_', parts), "::" + string.Join("::", parts));
+    }
+
+    private static string CallbackCppType(CXType type)
+    {
+        CXType canonical = clang.getCanonicalType(type);
+        if (canonical.kind is CXTypeKind.CXType_Enum)
+            return QualifiedName(clang.getTypeDeclaration(canonical)).Cpp
+                ?? clang.getTypeSpelling(type).ToString();
+
+        return clang.getTypeSpelling(type).ToString();
     }
 
     // ---- 类型转换 ----
@@ -357,10 +447,13 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
         if (_opaquePointers.TryGetValue(usr, out OpaquePointerInfo? existing))
             return existing;
 
-        string cppName = clang.getTypeSpelling(canonical).ToString()
-            .Replace("const ", "", StringComparison.Ordinal)
-            .Replace("volatile ", "", StringComparison.Ordinal)
-            .Trim();
+        string cppName = clang.getTypeSpelling(canonical).ToString().Trim();
+        while (cppName.StartsWith("const ", StringComparison.Ordinal)
+            || cppName.StartsWith("volatile ", StringComparison.Ordinal))
+        {
+            int qualifierLength = cppName.StartsWith("const ", StringComparison.Ordinal) ? 6 : 9;
+            cppName = cppName[qualifierLength..].TrimStart();
+        }
         int templateStart = cppName.IndexOf('<');
         if (templateStart is not -1)
         {
@@ -401,26 +494,17 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
             return genericPointer;
         }
 
-        string qualifiedName = QualifiedName(declaration).Cpp ?? Spelling(declaration);
         string shortName = Spelling(declaration);
         if (shortName.Length is 0)
             shortName = cppName;
-
-        string managedName = ManagedIdentifier(qualifiedName);
-        while (_classes.Values.Any(type => type.CName == managedName)
-            || _enums.Values.Any(type => type.CName == managedName)
-            || !_opaqueManagedNames.Add(managedName))
-        {
-            managedName += "Opaque";
-        }
 
         string identifier = NativeIdentifier(shortName);
         OpaquePointerInfo pointer = new(
             UniqueName("nbg_opaque_" + identifier),
             cppName,
-            managedName,
-            managedName,
-            $"public record struct {managedName}();");
+            "nint",
+            $"opaque:{usr}",
+            "");
         _opaquePointers.Add(usr, pointer);
         return pointer;
     }
@@ -500,6 +584,16 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
                 "bool" => "bool",
                 "char" or "unsigned char" => "byte",
                 "signed char" => "sbyte",
+                "size_t" or "uintptr_t" => "nuint",
+                "ptrdiff_t" or "ssize_t" or "intptr_t" => "nint",
+                "int8_t" => "sbyte",
+                "uint8_t" => "byte",
+                "int16_t" => "short",
+                "uint16_t" => "ushort",
+                "int32_t" => "int",
+                "uint32_t" => "uint",
+                "int64_t" => "long",
+                "uint64_t" => "ulong",
                 "short" => "short",
                 "unsigned short" => "ushort",
                 "int" => "int",
@@ -535,6 +629,16 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
             "bool" => "bool",
             "char" or "unsigned char" => "byte",
             "signed char" => "sbyte",
+            "size_t" or "uintptr_t" => "nuint",
+            "ptrdiff_t" or "ssize_t" or "intptr_t" => "nint",
+            "int8_t" => "sbyte",
+            "uint8_t" => "byte",
+            "int16_t" => "short",
+            "uint16_t" => "ushort",
+            "int32_t" => "int",
+            "uint32_t" => "uint",
+            "int64_t" => "long",
+            "uint64_t" => "ulong",
             "short" => "short",
             "unsigned short" => "ushort",
             "int" => "int",
@@ -893,6 +997,7 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
                     hasUserConstructor = true;
                     if (!isAbstract
                         && IsPublic(child)
+                        && IsQtMemberBindable(child)
                         && clang.CXXMethod_isDeleted(child) is 0)
                     {
                         TryBind(info, "create", () => BindConstructor(info, child));
@@ -902,6 +1007,7 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
 
                 case CXCursorKind.CXCursor_Destructor:
                     destructorExported = IsPublic(child)
+                        && IsQtMemberBindable(child)
                         && clang.CXXMethod_isDeleted(child) is 0;
                     break;
             }
@@ -973,6 +1079,7 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
 
                 case CXCursorKind.CXCursor_CXXMethod
                     when IsPublic(child)
+                        && IsQtMemberBindable(child)
                         && clang.CXXMethod_isDeleted(child) is 0
                         && !Spelling(child).StartsWith("operator", StringComparison.Ordinal)
                         && !(options.Qt && QtMetaMethods.Contains(Spelling(child))):
@@ -1160,7 +1267,7 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
         {
             CXType type = clang.getCursorType(clang.Cursor_getArgument(signal, (uint)i));
             var (h, c, expression) = ConvertCallbackArgument(type, $"p{i}");
-            string cppType = clang.getTypeSpelling(type).ToString();
+            string cppType = CallbackCppType(type);
             hTypes.Add(h);
             cTypes.Add(c);
             cppTypes.Add(cppType);
@@ -1184,7 +1291,7 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
         string sender = $"static_cast<{info.CppName}*>({SelfName})";
         Add(
             UniqueName($"{info.CName}_connect_{snake}"),
-            new("cppm_qt_connection*", "void*", x => x),
+            new(ConnectionTypeName + "*", "void*", x => x),
             [
                 new(info.CName + "*", "void*", SelfName),
                 new(callbackName, callbackName, "callback"),
@@ -1195,9 +1302,9 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
 
     private void BindConnectionDestroy()
         => Add(
-            UniqueName("cppm_qt_connection_destroy"),
+            UniqueName(ConnectionDestroyFunctionName),
             new("void", "void", x => x),
-            [new("cppm_qt_connection*", "void*", SelfName)],
+            [new(ConnectionTypeName + "*", "void*", SelfName)],
             $"[&] {{ auto* connection = static_cast<QMetaObject::Connection*>({SelfName}); QObject::disconnect(*connection); delete connection; }}()",
             isStatement: true);
 
@@ -1252,6 +1359,8 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
         ReturnPlan returnPlan = ConvertReturn(clang.getCursorResultType(method));
         bool isStatic = clang.CXXMethod_isStatic(method) is not 0;
         bool isConst = clang.CXXMethod_isConst(method) is not 0;
+        CXCursor declaring = clang.getCursorSemanticParent(method);
+        string declaringName = QualifiedName(declaring).Cpp ?? info.CppName;
 
         List<Param> parameters = [];
         List<string> arguments = [];
@@ -1261,8 +1370,8 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
 
         ConvertArguments(method, parameters, arguments);
         string target = isStatic
-            ? $"{info.CppName}::{name}"
-            : $"static_cast<{qualifier}{info.CppName}*>({SelfName})->{name}";
+            ? $"{declaringName}::{name}"
+            : $"static_cast<{qualifier}{declaringName}*>({SelfName})->{name}";
         Add(
             UniqueName($"{info.CName}_{name.Underscore()}"),
             returnPlan,
@@ -1281,7 +1390,8 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
                 .Select(index => clang.getTypeSpelling(clang.getCursorType(
                     clang.Cursor_getArgument(method, (uint)index))).ToString()));
         string isConst = clang.CXXMethod_isConst(method) is not 0 ? " const" : "";
-        return $"{returnType} {info.CppName}::{name}({parameters}){isConst}";
+        string declaringName = QualifiedName(clang.getCursorSemanticParent(method)).Cpp ?? info.CppName;
+        return $"{returnType} {declaringName}::{name}({parameters}){isConst}";
     }
 
     private void BindFieldGetter(ClassInfo info, string field, CXType type, string snake)
@@ -1354,7 +1464,7 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
             .OrderBy(c => c.CName, StringComparer.Ordinal)
             .Select(c => $"typedef struct {c.CName} {c.CName};"));
         if (_connectionUsed)
-            classes += "\ntypedef struct cppm_qt_connection cppm_qt_connection;";
+            classes += $"\ntypedef struct {ConnectionTypeName} {ConnectionTypeName};";
 
         string enums = string.Join("\n\n", _enums.Values
             .OrderBy(e => e.CName, StringComparer.Ordinal)
@@ -1391,7 +1501,7 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
 
             {{opaquePointers}}
 
-            void CPPM_CALL cppm_free_memory(void* pointer);
+            void CPPM_CALL {{FreeMemoryFunctionName}}(void* pointer);
             {{declarations}}
 
             #ifdef __cplusplus
@@ -1428,7 +1538,7 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
 
             {{typedefs}}
 
-            CPPM_EXPORT void CPPM_CALL cppm_free_memory(void* pointer)
+            CPPM_EXPORT void CPPM_CALL {{FreeMemoryFunctionName}}(void* pointer)
             {
                 cppm::release(pointer);
             }

@@ -231,8 +231,35 @@ internal sealed partial class CExportGenerator
                 """);
         }
 
-        foreach ((FunctionModel function, string name) in methods.OrderBy(m => m.Name, StringComparer.Ordinal))
+        HashSet<string> methodSignatures = [];
+        string UniqueMethodName(string methodName, string parameterTypes)
         {
+            string name = methodName;
+            string signature = $"{name}({parameterTypes})";
+            if (properties.ContainsKey(name)
+                || !methodSignatures.Add(signature))
+            {
+                for (int suffix = 2; ; suffix++)
+                {
+                    name = $"{methodName}_{suffix}";
+                    signature = $"{name}({parameterTypes})";
+                    if (!properties.ContainsKey(name)
+                        && methodSignatures.Add(signature))
+                    {
+                        break;
+                    }
+                }
+            }
+
+            return name;
+        }
+
+        foreach ((FunctionModel function, string methodName) in methods.OrderBy(m => m.Name, StringComparer.Ordinal))
+        {
+            string parameterTypes = string.Join(",", function.Parameters.Skip(1)
+                .Select(p => p.Type.Modifier + p.Type.Type));
+            string name = UniqueMethodName(methodName, parameterTypes);
+
             string parameters = string.Join(", ", function.Parameters.Skip(1)
                 .Select(p => $"{p.Type.Modifier}{p.Type.Type} {p.Name}"));
             blocks.Add($$"""
@@ -278,8 +305,12 @@ internal sealed partial class CExportGenerator
                 continue;
             }
 
+            string methodName = MemberName(raw);
+            string parameterTypes = string.Join(",", function.Parameters
+                .Select(p => p.Type.Modifier + p.Type.Type));
+            methodName = UniqueMethodName(methodName, parameterTypes);
             blocks.Add($$"""
-                    public static {{function.Return.Type}} {{MemberName(raw)}}({{parameters}})
+                    public static {{function.Return.Type}} {{methodName}}({{parameters}})
                     {
                         {{(function.Return.Type is "void" ? "" : "return ")}}{{call}};
                     }
