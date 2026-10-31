@@ -68,6 +68,8 @@ internal sealed unsafe partial class CExportGenerator(ICExportGeneratorOptions o
     internal IReadOnlyDictionary<string, (string ManagedType, string NativeName, string DeclarationKey, string Declaration)> OpaquePointerTypes { get; init; }
         = new Dictionary<string, (string ManagedType, string NativeName, string DeclarationKey, string Declaration)>(StringComparer.Ordinal);
 
+    internal string FreeMemoryFunctionName { get; init; } = "cppm_free_memory";
+
     public void Generate()
     {
         LibClangLoader.Ensure();
@@ -387,7 +389,8 @@ internal sealed unsafe partial class CExportGenerator(ICExportGeneratorOptions o
             hiddenParameters,
             qtArrays,
             qtReturnCountIndex,
-            qtReturnElementType)}";
+            qtReturnElementType,
+            FreeMemoryFunctionName)}";
     }
 
     private static string QtArrayWrapper(
@@ -401,7 +404,8 @@ internal sealed unsafe partial class CExportGenerator(ICExportGeneratorOptions o
         HashSet<int> hiddenParameters,
         Dictionary<int, QtArrayParameter> arrays,
         int? returnCountIndex,
-        string? returnElementType)
+        string? returnElementType,
+        string freeMemoryFunctionName)
     {
         List<string> declarations = models
             .Select(parameter => $"{parameter.Type.Modifier}{parameter.Type.Type} {parameter.Name}")
@@ -462,7 +466,7 @@ internal sealed unsafe partial class CExportGenerator(ICExportGeneratorOptions o
                     }
                     finally
                     {
-                        cppm_free_memory((nint)_cppmResult);
+                        NativeMethods.{{freeMemoryFunctionName}}((nint)_cppmResult);
                     }
                 """;
             body = "nuint _cppmCount;\n" + body;

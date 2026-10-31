@@ -241,6 +241,9 @@ internal sealed unsafe partial class CExportGenerator
                 string nativeTypeName = clang.getCursorSpelling(declaration).ToString();
                 if (OpaquePointerTypes.TryGetValue(nativeTypeName, out var opaqueType))
                 {
+                    if (opaqueType.ManagedType is "nint")
+                        return new("nint");
+
                     _typeSources.TryAdd(opaqueType.DeclarationKey, $$"""
                         /// <summary>
                         /// 原生不透明指针类型：<c>{{XmlEscape(opaqueType.NativeName)}}</c>。

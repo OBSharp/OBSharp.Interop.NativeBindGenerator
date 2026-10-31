@@ -138,7 +138,7 @@ NativeBindGenerator \
 ### C 声明
 
 - 常见 C 整数和浮点类型映射到对应的 C# 基本类型；`long` 和 `unsigned long` 分别映射为 `CLong` 和 `CULong`。
-- `size_t`、`uintptr_t`、`ptrdiff_t`、`intptr_t` 及定宽整数类型会映射为相应的本机整数或 C# 整数类型。
+- `size_t` 和 `uintptr_t` 映射为随进程位数变化的 `nuint`；`ptrdiff_t`、`ssize_t` 和 `intptr_t` 映射为 `nint`。定宽整数按原生符号性映射为对应的 C# 整数类型；普通 `char` 映射为 `byte`，`signed char` 映射为 `sbyte`。
 - `const char*` 参数和返回值默认按 UTF-8 字符串处理；可分别通过 `--string-marshaller` 和 `--return-string-marshaller` 指定自定义 marshaller。
 - `bool` 参数和返回值默认使用 1 字节封送；`--four-byte-boolean` 可切换为 4 字节封送。
 - 函数指针生成为 `delegate* unmanaged`；数组以指针形式表示。
@@ -147,9 +147,9 @@ NativeBindGenerator \
 
 ### C++ 转发
 
-`--cpp-redirect` 会为头文件中的可处理 C++ 类和枚举生成 C 式导出。该模式支持常见标量、枚举、类对象和指针，以及部分字符串和 `std::vector` 转换。指向未在指定头文件中发现定义的 C++ 类的指针会生成为 C# 不透明 `record struct` 指针（例如 `QWindow*`）；未知指针则回退为 `nint`，不会仅因指针类型无法细化映射而跳过。模板特化指针使用 C# 泛型不透明结构体（例如 `QList<nint>*`），避免把 C++ 模板拼写直接当作 C# 标识符。具体可处理的类型取决于声明形式以及传入的 Clang 参数。
+`--cpp-redirect` 会为头文件中的可处理 C++ 类和枚举生成 C 式导出。该模式支持常见标量、枚举、类对象和指针，以及部分字符串和 `std::vector` 转换。指向未在指定头文件中发现定义的 C++ 类的指针会回退为 `nint`，不会仅因指针类型无法细化映射而跳过。模板特化指针使用 C# 泛型不透明结构体（例如 `QList<nint>*`），避免把 C++ 模板拼写直接当作 C# 标识符；跨模块的不透明指针不会重复声明冲突的托管类型。具体可处理的类型取决于声明形式以及传入的 Clang 参数。
 
-启用 `--qt` 时，自动数组转换支持元素为 C 基本类型或指针的 `QList<T>`；托管 API 使用 `ReadOnlySpan<T>`，指针元素以 `nint` 表示，native 边界使用元素指针与 `size_t`，并在 C++ 包装中转换为 `QList<T>`。返回值会复制到托管内存后以只读跨度返回。其他复杂值类型的 `QList<T>` 尚未支持自动跨度转换。
+启用 `--qt` 时，自动数组转换支持元素为 C 基本类型或指针的 `QList<T>`；托管 API 使用 `ReadOnlySpan<T>`，指针元素以 `nint` 表示，native 边界使用元素指针与 `size_t`，并在 C++ 包装中转换为 `QList<T>`。返回值会复制到托管内存后以只读跨度返回。其他复杂值类型的 `QList<T>` 尚未支持自动跨度转换。`size_t`、`uintptr_t` 等无符号原生宽度整数映射为 `nuint`；`ptrdiff_t` 等有符号原生宽度整数映射为 `nint`，宽度均随目标平台变化。
 
 ## 注意事项
 
