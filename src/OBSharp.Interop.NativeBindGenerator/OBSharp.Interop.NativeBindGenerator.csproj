@@ -3,7 +3,6 @@
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <PackAsTool>True</PackAsTool>
-    <ToolPackageRuntimeIdentifiers>linux-arm64;linux-x64;osx-arm64;win-arm64;win-x64</ToolPackageRuntimeIdentifiers>
     <RuntimeIdentifiers>linux-arm64;linux-x64;osx-arm64;win-arm64;win-x64</RuntimeIdentifiers>
   </PropertyGroup>
 
