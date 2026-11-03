@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "isRoot": true,
+  "tools": {
+    "shimakaze.gitsemver": {
+      "version": "0.0.1-preview.1",
+      "commands": [
+        "gitver"
+      ],
+      "rollForward": false
+    }
+  }
+}
