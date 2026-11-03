@@ -1,0 +1,212 @@
+name: 构建
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: pwsh
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: 1
+
+jobs:
+  build:
+    name: 构建
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 签出仓库
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: 配置 .Net 环境
+        uses: actions/setup-dotnet@v6
+        with:
+          global-json-file: ./global.json
+
+      - name: 配置 NuGet 源
+        run: |
+          dotnet nuget update source OBSharp `
+            --username "github-actions[bot]" `
+            --password "${{ github.token }}" `
+            --store-password-in-clear-text
+
+      - name: 还原 .Net 工具
+        run: dotnet tool restore
+
+      - name: 生成版本文件
+        run: |
+          "### Version Information" >> $env:GITHUB_STEP_SUMMARY
+          '```' >> $env:GITHUB_STEP_SUMMARY
+          $Version = dotnet tool run gitver | ConvertFrom-Json
+          $Version >> $env:GITHUB_STEP_SUMMARY
+          '```' >> $env:GITHUB_STEP_SUMMARY
+          @"
+          <Project>
+            <PropertyGroup>
+              <Version>$($Version.SemVer)</Version>
+              <VersionPrefix>$($Version.MajorMinorPatch)</VersionPrefix>
+              <VersionSuffix>$($Version.PreReleaseTag)</VersionSuffix>
+              <PackageVersion>$($Version.FullSemVer)</PackageVersion>
+              <InformationalVersion>$($Version.InformationalVersion)</InformationalVersion>
+              <AssemblyVersion>$($Version.AssemblySemVer)</AssemblyVersion>
+              <FileVersion>$($Version.AssemblyFileSemVer)</FileVersion>
+              <RepositoryBranch>$($Version.Branch)</RepositoryBranch>
+              <RepositoryCommit>$($Version.Sha)</RepositoryCommit>
+            </PropertyGroup>
+          </Project>
+          "@ | Set-Content Directory.Version.props -Encoding utf8
+
+      - name: 还原
+        run: dotnet restore --graph --artifacts-path artifacts
+
+      - name: 打包
+        run: dotnet pack --graph --artifacts-path artifacts --configuration Release --no-restore
+
+      - name: 生成校验和
+        run: |
+          $Algorithm = 'SHA256'
+
+          "### Build Success :rocket:" >> $env:GITHUB_STEP_SUMMARY
+          "| FileName | $Algorithm |" >> $env:GITHUB_STEP_SUMMARY
+          "| :- | :-: |" >> $env:GITHUB_STEP_SUMMARY
+
+          Get-ChildItem artifacts/package/release -File |
+            Sort-Object Name |
+            ForEach-Object {
+              $Name = $PSItem.Name
+              $Hash = (Get-FileHash $PSItem.FullName -Algorithm $Algorithm).Hash
+
+              "| $Name | $Hash |" >> $env:GITHUB_STEP_SUMMARY
+            }
+
+      - name: 收集 NuGet 包
+        uses: actions/upload-artifact@v7
+        with:
+          name: nuget-packages
+          path: artifacts/package/release/*
+          if-no-files-found: error
+          retention-days: 3
+
+  comment:
+    needs: build
+    name: 评论
+    if: github.event_name == 'pull_request'
+    permissions:
+      pull-requests: write
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 下载构建产物
+        uses: actions/download-artifact@v8
+        with:
+          name: nuget-packages
+          path: artifacts
+
+      - name: 生成校验和
+        id: checksum
+        run: |
+          $Algorithm = 'SHA256'
+          $Files = Get-ChildItem artifacts -File |
+            Where-Object { $_.Extension -in '.nupkg', '.snupkg' } |
+            Sort-Object Name
+
+          $Rows = @(
+            '| FileName | SHA256 |'
+            '| :- | :-: |'
+          )
+
+          foreach ($File in $Files) {
+            $Hash = (Get-FileHash $File.FullName -Algorithm $Algorithm).Hash
+            $Rows += "| $($File.Name) | $Hash |"
+          }
+
+          $Rows -join "`n" | Set-Content checksum.md -Encoding utf8
+
+      - name: 在 PR 里发送评论
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          $Checksum = Get-Content checksum.md -Raw
+
+          $Body = @"
+          ## :rocket: Build artifacts are available
+
+          [Download NuGet Packages](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+          $Checksum
+          "@
+
+          gh pr comment $env:PR_NUMBER `
+            --body $Body `
+            --create-if-none `
+            --edit-last
+
+  release:
+    needs: build
+    name: 发布
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+      discussions: write
+      packages: write
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 签出仓库
+        uses: actions/checkout@v7
+        with:
+          sparse-checkout: "."
+
+      - name: 配置 .Net 环境
+        uses: actions/setup-dotnet@v6
+        with:
+          global-json-file: ./global.json
+          cache: false
+
+      - name: 配置 NuGet 源
+        run: |
+          dotnet nuget update source OBSharp `
+            --username "github-actions[bot]" `
+            --password "${{ github.token }}" `
+            --store-password-in-clear-text
+
+      - name: 下载构建产物
+        uses: actions/download-artifact@v8
+        with:
+          name: nuget-packages
+          path: artifacts
+
+      - name: Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            artifacts/*.nupkg
+            artifacts/*.snupkg
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref, '-') }}
+
+      - name: 推送 NuGet 包
+        run: |
+          Get-ChildItem artifacts -File |
+            Where-Object {
+              $_.Extension -in '.nupkg', '.snupkg'
+            } |
+            Sort-Object Name |
+            ForEach-Object {
+              dotnet nuget push $PSItem.FullName `
+                --source OBSharp `
+                --skip-duplicate
+            }
