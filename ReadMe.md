@@ -10,6 +10,7 @@ OBSharp.Interop.NativeBindGenerator 是一个基于 libclang 的命令行工具�
 - .NET SDK 11（项目通过 [`global.json`](./global.json) 指定 SDK 版本）。
 - 生成器解析头文件所需的 Clang 参数，例如包含目录、宏定义及语言标准。
 - 使用 `--cpp-redirect` 时，还需使用与目标 C++ 库相匹配的编译器和构建配置编译生成的 native 文件。
+- 发布包按运行时标识（RID）分发：主包只包含工具清单，实际工具与 `libclang`、`libClangSharp` 原生库位于各 RID 子包中，安装时按当前平台自动选择，无需另行安装 Clang 或复制原生库。
 
 ## 安装与构建
 
@@ -35,6 +36,8 @@ dotnet tool install --global OBSharp.Interop.NativeBindGenerator \
 ```shell
 dotnet run --project src/OBSharp.Interop.NativeBindGenerator -- --help
 ```
+
+发布时需要同时推送主包和全部 RID 子包（`win-x64`、`win-arm64`、`linux-x64`、`linux-arm64`、`osx-arm64`），否则安装时会缺少对应平台的原生库。
 
 ## 基本用法
 
