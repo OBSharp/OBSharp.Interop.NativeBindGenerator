@@ -1,4 +1,4 @@
-using System.Text;
+using System.Globalization;
 using System.Text.RegularExpressions;
 
 using ClangSharp.Interop;
@@ -381,8 +381,8 @@ internal sealed unsafe partial class CExportGenerator
             .Select(constant =>
             {
                 string value = isSigned
-                    ? clang.getEnumConstantDeclValue(constant).ToString()
-                    : clang.getEnumConstantDeclUnsignedValue(constant).ToString();
+                    ? clang.getEnumConstantDeclValue(constant).ToString(CultureInfo.InvariantCulture)
+                    : clang.getEnumConstantDeclUnsignedValue(constant).ToString(CultureInfo.InvariantCulture);
                 return $"    {Identifier(clang.getCursorSpelling(constant).ToString())} = {value},";
             }));
 
@@ -514,7 +514,7 @@ internal sealed unsafe partial class CExportGenerator
             string element = MapType(clang.getArrayElementType(shape), TypePosition.Field).Type;
             long count = clang.getNumElements(shape);
             if (FixedBufferTypes.Contains(element))
-                return (element, count.ToString());
+                return (element, count.ToString(CultureInfo.InvariantCulture));
 
             string bufferName = $"{owner}_{fieldName.TrimStart('@')}_Buffer";
             _typeSources[bufferName] = $$"""

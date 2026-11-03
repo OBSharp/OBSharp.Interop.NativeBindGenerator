@@ -2,6 +2,7 @@
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
+    <PackAsTool>True</PackAsTool>
   </PropertyGroup>
 
   <ItemGroup>

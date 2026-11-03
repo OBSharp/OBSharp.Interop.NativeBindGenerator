@@ -26,6 +26,12 @@
         "resolved": "3.0.10",
         "contentHash": "yZIhtw8sYuvsONzQbZxWpR60tMWYHXoo0DL6nyOqSFiU5POjBTSEyWFpTQtJEZuy+oqiYTXKXY/Mjx7KnqIQFw=="
       },
+      "Microsoft.NET.ILLink.Tasks": {
+        "type": "Direct",
+        "requested": "[11.0.0-rc.3.26522.148, )",
+        "resolved": "11.0.0-rc.3.26522.148",
+        "contentHash": "SWnTMx96mhBr9LCOySJg1ETlEFFHVsPGdVT02JnYhtqk1+Vke1J7RU3VkKwEiErBr4FJ42Uu4k7GdOtkRuvs/Q=="
+      },
       "ClangSharp.Interop": {
         "type": "Transitive",
         "resolved": "21.1.8.4",

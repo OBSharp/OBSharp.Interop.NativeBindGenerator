@@ -218,7 +218,7 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
             string name = Spelling(current);
             switch (kind)
             {
-                case CXCursorKind.CXCursor_Namespace when name.StartsWith("__"):
+                case CXCursorKind.CXCursor_Namespace when name.StartsWith("__", StringComparison.Ordinal):
                     break;
                 case CXCursorKind.CXCursor_Namespace when name.Length is 0:
                     return (null, null);
@@ -605,7 +605,7 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
                 case CXCursorKind.CXCursor_CXXMethod
                     when IsPublic(child)
                         && clang.CXXMethod_isDeleted(child) is 0
-                        && !Spelling(child).StartsWith("operator")
+                        && !Spelling(child).StartsWith("operator", StringComparison.Ordinal)
                         && !(options.Qt && QtMetaMethods.Contains(Spelling(child))):
                     yield return (child, inSignals);
                     break;
@@ -815,7 +815,7 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
             $"[&] {{ auto* connection = static_cast<QMetaObject::Connection*>({SelfName}); QObject::disconnect(*connection); delete connection; }}()",
             isStatement: true);
 
-    private void TryBind(ClassInfo info, string description, Action bind)
+    private static void TryBind(ClassInfo info, string description, Action bind)
     {
         try
         {
