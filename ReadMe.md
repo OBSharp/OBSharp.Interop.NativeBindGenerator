@@ -74,7 +74,14 @@ NativeBindGenerator \
   -std=c17
 ```
 
-生成器会在 `generated/csharp` 下写入 `NativeMethods.g.cs`，并在有相关类型时写入 `NativeTypes.g.cs`。将这些文件加入 C# 项目，并确保运行时能够加载 `--library-name` 指定的原生库。
+生成器会在 `generated/csharp` 下按声明拆分为多个 `*.g.cs` 文件（均是统一命名空间下的 partial 声明）：
+
+- 能按名称前缀与首参类型归类到某个类型的函数，其 `LibraryImport` 声明、全局包装和成员方法都写入该类型的 `*.g.cs` 文件，并放在同一个 partial 类型里；例如 `widget_get_value` 会进入 `Widget` 类型，调用处无需再经过 `NativeMethods`。
+- 返回某个句柄类型的工厂函数（如 `Widget * Widget_create(int)`、`OpaqueContext * opaque_create(void)`）也会进入该类型，并生成静态方法而不是构造函数，例如 `Widget.Create(42)`、`OpaqueContext.OpaqueCreate()`。
+- 只有当函数无法归类（没有对应的类型前缀、首参不属于任何已生成类型，且返回类型也不是句柄类型）时，才作为全局函数写入 `NativeMethods.g.cs`；数量较多时继续拆成 `NativeMethods.2.g.cs`、`NativeMethods.3.g.cs` 等 partial 分片。
+- 每个结构体、联合体、枚举、SafeHandle 以及定长数组的 `InlineArray` 类型各写入一个以类型名命名的 `*.g.cs` 文件；类型定义、成员扩展与导入声明写在同一个文件中。
+
+分散文件可让 Roslyn 并行解析并按文件增量编译，避免单个巨大文件拖慢编译。将这些文件加入 C# 项目，并确保运行时能够加载 `--library-name` 指定的原生库。
 
 ### 为 C++ 类生成包装和 C# 绑定
 
@@ -100,6 +107,8 @@ NativeBindGenerator \
 - `cpp_marshaller.hpp`：包装代码使用的类型转换和内存管理工具。
 
 生成的 native 源码需要使用目标库对应的编译器、头文件、宏和链接设置构建成原生库。`--library-name` 应与最终加载的库名称相符。
+
+native 产物刻意保持为单个 `.cpp` 翻译单元（unity 构建）：C++ 编译时间的绝大部分消耗在解析原始头文件与模板上，若按函数拆成多个翻译单元，每个文件都要重复解析一遍全部头文件，通常反而更慢。需要并行编译时，可自行按导出函数把 `*.cpp` 拆分到多个文件（各文件重复包含同一组头文件即可）。
 
 ### Qt 支持
 

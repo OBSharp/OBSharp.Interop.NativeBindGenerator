@@ -123,7 +123,15 @@ internal sealed unsafe partial class CExportGenerator(ICExportGeneratorOptions o
             throw new InvalidOperationException("指定头文件中没有找到可绑定的 C 函数导出声明");
 
         Emit();
-        Console.WriteLine($"生成了 {_functions.Count} 个函数、{_typeSources.Count} 个类型的 C# 绑定。");
+
+        // 成员扩展片段与类型定义分开存放，统计类型数时按去掉 #members 后的类型名去重
+        int typeCount = _typeSources.Keys
+            .Select(key => key.EndsWith(MembersKeySuffix, StringComparison.Ordinal)
+                ? key[..^MembersKeySuffix.Length]
+                : key)
+            .Distinct(StringComparer.Ordinal)
+            .Count();
+        Console.WriteLine($"生成了 {_functions.Count} 个函数、{typeCount} 个类型的 C# 绑定。");
     }
 
     internal static bool ReportErrors(CXTranslationUnit tu)
@@ -521,6 +529,21 @@ internal sealed unsafe partial class CExportGenerator(ICExportGeneratorOptions o
             _ => "CallConvCdecl",
         };
 
+    /// <summary>
+    /// 每个 <c>NativeMethods</c> 分片最多包含的全局函数数量；超出后写入下一个 partial 分片文件。
+    /// </summary>
+    private const int FunctionsPerFile = 64;
+
+    /// <summary>
+    /// 成员扩展片段在 <see cref="_typeSources"/> 中的键后缀，用于与类型定义合并到同一文件。
+    /// </summary>
+    private const string MembersKeySuffix = "#members";
+
+    /// <summary>
+    /// 类型文件名主体的最大长度，避免过长的模板类型名产生超长路径。
+    /// </summary>
+    private const int MaxFileBaseNameLength = 120;
+
     private void Emit()
     {
         string output = Path.GetFullPath(options.CsharpOutput);
@@ -528,32 +551,127 @@ internal sealed unsafe partial class CExportGenerator(ICExportGeneratorOptions o
         foreach (string staleFile in Directory.EnumerateFiles(output, "*.g.cs", SearchOption.AllDirectories))
             File.Delete(staleFile);
 
-        string methodSources = string.Join("\n\n", _functions
-            .OrderBy(f => f.Name, StringComparer.Ordinal)
-            .Select(f => f.Source));
-        string methods = $$"""
-            {{Header()}}
-            public static unsafe partial class NativeMethods
-            {
-            {{methodSources}}
-            }
-
-            """;
-        File.WriteAllText(Path.Combine(output, "NativeMethods.g.cs"), methods.ReplaceLineEndings("\n"), new UTF8Encoding(false));
-
-        if (_typeSources.Count is 0)
-            return;
-
-        string typeSources = string.Join("\n\n", _typeSources
-            .OrderBy(t => t.Key, StringComparer.Ordinal)
-            .Select(t => t.Value));
-        string types = $$"""
-            {{Header()}}
-            {{typeSources}}
-
-            """;
-        File.WriteAllText(Path.Combine(output, "NativeTypes.g.cs"), types.ReplaceLineEndings("\n"), new UTF8Encoding(false));
+        // 函数与类型一起参与文件名去重，避免类型名与 NativeMethods 分片重名
+        HashSet<string> usedNames = [with(StringComparer.OrdinalIgnoreCase)];
+        EmitMethods(output, usedNames);
+        EmitTypes(output, usedNames);
     }
+
+    /// <summary>
+    /// 生成调用目标：函数已归入当前类型时直接调用，否则仍走 <c>NativeMethods</c>。
+    /// </summary>
+    private string CallTarget(string functionName, string? ownerType)
+        => ownerType is not null
+            && _functionOwners.TryGetValue(functionName, out string? owner)
+            && owner == ownerType
+                ? Identifier(functionName)
+                : "NativeMethods." + Identifier(functionName);
+
+    private void EmitMethods(string output, HashSet<string> usedNames)
+    {
+        // 只有无法归入任何类型的全局函数才留在 NativeMethods
+        List<(string Name, string Source)> functions = [.. _functions
+            .Where(function => !_functionOwners.ContainsKey(function.Name))
+            .OrderBy(function => function.Name, StringComparer.Ordinal)];
+        for (int offset = 0; offset < functions.Count; offset += FunctionsPerFile)
+        {
+            int part = offset / FunctionsPerFile;
+            string baseName = part is 0 ? "NativeMethods" : $"NativeMethods.{part + 1}";
+            _ = usedNames.Add(baseName);
+
+            string methodSources = string.Join("\n\n", functions
+                .Skip(offset)
+                .Take(FunctionsPerFile)
+                .Select(function => function.Source));
+            WriteCSharpFile(Path.Combine(output, baseName + ".g.cs"), $$"""
+                {{Header()}}
+                public static unsafe partial class NativeMethods
+                {
+                {{methodSources}}
+                }
+
+                """);
+        }
+    }
+
+    private void EmitTypes(string output, HashSet<string> usedNames)
+    {
+        Dictionary<string, List<string>> blocks = new(StringComparer.Ordinal);
+
+        // 类型定义与成员扩展（#members）写入同一文件
+        foreach ((string key, string source) in _typeSources.OrderBy(entry => entry.Key, StringComparer.Ordinal))
+        {
+            string typeName = key.EndsWith(MembersKeySuffix, StringComparison.Ordinal)
+                ? key[..^MembersKeySuffix.Length]
+                : key;
+            AddTypeBlock(blocks, typeName, source);
+        }
+
+        // 导入声明写入其所属类型；没有归属的全局函数不在其中
+        Dictionary<string, List<string>> imports = new(StringComparer.Ordinal);
+        foreach ((string functionName, string source) in _functions.OrderBy(function => function.Name, StringComparer.Ordinal))
+        {
+            if (_functionOwners.TryGetValue(functionName, out string? owner))
+                AddTypeBlock(imports, owner, source);
+        }
+
+        foreach ((string owner, List<string> sources) in imports.OrderBy(entry => entry.Key, StringComparer.Ordinal))
+            AddTypeBlock(blocks, owner, ImportBlock(owner, string.Join("\n\n", sources)));
+
+        foreach ((string typeName, List<string> typeBlocks) in blocks.OrderBy(entry => entry.Key, StringComparer.Ordinal))
+        {
+            string baseName = FileBaseName(typeName);
+            string name = baseName;
+            for (int suffix = 2; !usedNames.Add(name); suffix++)
+                name = $"{baseName}_{suffix}";
+
+            WriteCSharpFile(Path.Combine(output, name + ".g.cs"), $$"""
+                {{Header()}}
+                {{string.Join("\n\n", typeBlocks)}}
+
+                """);
+        }
+    }
+
+    private static void AddTypeBlock(Dictionary<string, List<string>> blocks, string typeName, string source)
+    {
+        if (!blocks.TryGetValue(typeName, out List<string>? list))
+            blocks[typeName] = list = [];
+        list.Add(source);
+    }
+
+    /// <summary>
+    /// 把导入声明包进所属类型的 partial 声明，让 P/Invoke 与使用它的成员位于同一类型。
+    /// </summary>
+    private string ImportBlock(string typeName, string source)
+    {
+        string declaration = _owners.TryGetValue(typeName, out (string CName, bool IsHandle) owner) && owner.IsHandle
+            ? $"public sealed unsafe partial class {typeName}"
+            : $"public unsafe partial struct {typeName}";
+        return $$"""
+            {{declaration}}
+            {
+            {{source}}
+            }
+            """;
+    }
+
+    private static string FileBaseName(string key)
+    {
+        StringBuilder builder = new(Math.Min(key.Length, MaxFileBaseNameLength));
+        foreach (char character in key)
+        {
+            if (builder.Length is MaxFileBaseNameLength)
+                break;
+
+            builder.Append(char.IsLetterOrDigit(character) || character is '_' ? character : '_');
+        }
+
+        return builder.Length is 0 ? "Type" : builder.ToString();
+    }
+
+    private static void WriteCSharpFile(string path, string content)
+        => File.WriteAllText(path, content.ReplaceLineEndings("\n"), new UTF8Encoding(false));
 
     private string Header()
         => $$"""

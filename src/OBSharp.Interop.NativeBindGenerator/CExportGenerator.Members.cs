@@ -29,6 +29,11 @@ internal sealed partial class CExportGenerator
     private readonly List<FunctionModel> _models = [];
 
     /// <summary>
+    /// C 函数名 → 所属 C# 类型名；未登记的函数属于全局函数，仍写入 NativeMethods。
+    /// </summary>
+    private readonly Dictionary<string, string> _functionOwners = new(StringComparer.Ordinal);
+
+    /// <summary>
     /// 首参 C# 类型文本 → (C 类型名, 是否为 SafeHandle 类)。
     /// </summary>
     private readonly Dictionary<string, (string CName, bool IsHandle)> _owners = [];
@@ -72,6 +77,7 @@ internal sealed partial class CExportGenerator
             }
 
             string typeName = owner.IsHandle ? first.Type.Type : first.Type.Type[..^1];
+            _functionOwners[function.Name] = typeName;
             if (!groups.TryGetValue(typeName, out var list))
                 groups[typeName] = list = [];
             list.Add((function, function.Name[(owner.CName.Length + 1)..]));
@@ -91,9 +97,40 @@ internal sealed partial class CExportGenerator
                 continue;
 
             string typeName = match.Value.IsHandle ? match.Key : match.Key[..^1];
+            _functionOwners[function.Name] = typeName;
             if (!statics.TryGetValue(typeName, out var list))
                 statics[typeName] = list = [];
             list.Add((function, function.Name[(match.Value.CName.Length + 1)..]));
+        }
+
+        // 返回某句柄类型的工厂/转换函数（如 Type* type_create()）也归入该类型作为静态成员
+        foreach (FunctionModel function in _models.Where(f =>
+            !_functionOwners.ContainsKey(f.Name)
+            && !_releaseFunctions.ContainsKey(f.Name)
+            && f.Return.Attribute.Length is 0
+            && f.Return.Modifier.Length is 0))
+        {
+            if (!_owners.TryGetValue(function.Return.Type, out (string CName, bool IsHandle) owner)
+                || !owner.IsHandle)
+            {
+                continue;
+            }
+
+            string typeName = function.Return.Type;
+            _functionOwners[function.Name] = typeName;
+            if (!statics.TryGetValue(typeName, out var list))
+                statics[typeName] = list = [];
+            list.Add((function, function.Name.Length > owner.CName.Length + 1
+                && function.Name.StartsWith(owner.CName + "_", StringComparison.OrdinalIgnoreCase)
+                    ? function.Name[(owner.CName.Length + 1)..]
+                    : function.Name));
+        }
+
+        // 释放函数的首参被映射为 nint（避免句柄自引用），需按记录键单独归入对应句柄类
+        foreach ((uint key, string functionName) in _handleReleases)
+        {
+            if (_handleNames.TryGetValue(key, out string? handleName))
+                _functionOwners.TryAdd(functionName, handleName);
         }
 
         foreach (string typeName in groups.Keys.Union(statics.Keys))
@@ -107,7 +144,7 @@ internal sealed partial class CExportGenerator
         }
     }
 
-    private static string MembersSource(
+    private string MembersSource(
         string typeName,
         bool isHandle,
         List<(FunctionModel Function, string Remainder)> members,
@@ -270,40 +307,12 @@ internal sealed partial class CExportGenerator
                 """);
         }
 
-        HashSet<string> constructorSignatures = [];
         foreach ((FunctionModel function, string raw) in staticMembers.OrderBy(m => m.Remainder, StringComparer.Ordinal))
         {
             string parameters = string.Join(", ", function.Parameters
                 .Select(p => $"{p.Type.Modifier}{p.Type.Type} {p.Name}"));
             string arguments = string.Join(", ", function.Parameters.Select(p => p.Type.Modifier + p.Name));
-            string call = $"NativeMethods.{Identifier(function.Name)}({arguments})";
-
-            // 返回自身类型的 create/new 工厂函数写成构造函数；
-            // SafeHandle 的无参构造函数已被 marshaller 占用，无参工厂保持静态方法
-            if (IsFactoryName(raw)
-                && function.Return.Type == typeName
-                && (!isHandle || function.Parameters.Count is not 0)
-                && constructorSignatures.Add(string.Join(",", function.Parameters.Select(p => p.Type.Modifier + p.Type.Type))))
-            {
-                // SafeHandle 通过转移已创建句柄的所有权完成构造
-                string constructor = isHandle
-                    ? $$"""
-                            public {{typeName}}({{parameters}}) : this()
-                            {
-                                using var created = {{call}};
-                                SetHandle(created.DangerousGetHandle());
-                                created.SetHandleAsInvalid();
-                            }
-                        """
-                    : $$"""
-                            public {{typeName}}({{parameters}})
-                            {
-                                this = {{call}};
-                            }
-                        """;
-                blocks.Insert(0, constructor);
-                continue;
-            }
+            string call = $"{CallTarget(function.Name, typeName)}({arguments})";
 
             string methodName = MemberName(raw);
             string parameterTypes = string.Join(",", function.Parameters
@@ -326,12 +335,7 @@ internal sealed partial class CExportGenerator
             """;
     }
 
-    private static bool IsFactoryName(string remainder)
-        => remainder is "create" or "new"
-            || remainder.StartsWith("create_", StringComparison.Ordinal)
-            || remainder.StartsWith("new_", StringComparison.Ordinal);
-
-    private static string Body(
+    private string Body(
         FunctionModel function,
         string typeName,
         bool isHandle,
@@ -349,7 +353,7 @@ internal sealed partial class CExportGenerator
                 : parameter.Type.Modifier + parameter.Name);
         }
 
-        string call = $"{prefix}NativeMethods.{Identifier(function.Name)}({string.Join(", ", arguments)});";
+        string call = $"{prefix}{CallTarget(function.Name, typeName)}({string.Join(", ", arguments)});";
         return isHandle
             ? pad + call
             : $$"""

@@ -360,7 +360,7 @@ internal sealed unsafe partial class CExportGenerator
         {
             bool hasRelease = _handleReleases.TryGetValue(key, out string? release);
             string releaseCall = hasRelease
-                ? $"NativeMethods.{Identifier(release!)}(handle);"
+                ? $"{CallTarget(release!, name)}(handle);"
                 : "// 头文件中没有识别到释放函数，句柄不拥有原生对象";
             string rawType = _handleNativeTypes[key];
             _typeSources[name] = $$"""
