@@ -22,7 +22,7 @@ internal sealed unsafe partial class CExportGenerator
         Nested,
     }
 
-    private sealed record MappedType(string Type, string Attribute = "", string Modifier = "");
+    private sealed record MappedType(string Type, string Attribute = "", string Modifier = "", string ImportType = "");
 
     private sealed record FieldInfo(
         string Name,
@@ -263,7 +263,7 @@ internal sealed unsafe partial class CExportGenerator
                     return new("nint");
                 }
 
-                return new(HandleName(declaration));
+                return HandleType(HandleName(declaration), position);
             }
         }
 
@@ -279,6 +279,21 @@ internal sealed unsafe partial class CExportGenerator
             ? "[MarshalAs(UnmanagedType.LPUTF8Str)] "
             : $"[MarshalUsing(typeof({marshaller}))] ";
     }
+
+    /// <summary>
+    /// 句柄类型映射。指定 <see cref="ICExportGeneratorOptions.NullableHandleMarshaller"/> 后，
+    /// 参数位置的句柄会生成 <c>Xxx?</c> 并附加自定义 marshaller，使托管 <c>null</c> 映射为原生 NULL。
+    /// 导入声明使用 <c>SafeHandle?</c> 以便自定义 marshaller 能同时覆盖所有句柄类型；
+    /// 包装 API 仍保留具体的 <c>Xxx?</c> 类型。
+    /// </summary>
+    private MappedType HandleType(string handleName, TypePosition position)
+        => position is TypePosition.Parameter
+            && options.NullableHandleMarshaller.Length is not 0
+                ? new(
+                    handleName + "?",
+                    $"[MarshalUsing(typeof({options.NullableHandleMarshaller}))] ",
+                    ImportType: "SafeHandle?")
+                : new(handleName);
 
     private string FunctionPointerType(CXType function)
     {

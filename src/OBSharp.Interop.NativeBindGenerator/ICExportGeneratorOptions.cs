@@ -9,5 +9,6 @@ public interface ICExportGeneratorOptions
     bool FourByteBoolean { get; set; }
     string StringMarshaller { get; set; }
     string ReturnStringMarshaller { get; set; }
+    string NullableHandleMarshaller { get; set; }
     string[] ClangArguments { get; }
 }

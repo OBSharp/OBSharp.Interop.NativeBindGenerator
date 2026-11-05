@@ -348,7 +348,8 @@ internal sealed unsafe partial class CExportGenerator(ICExportGeneratorOptions o
             }
             else
             {
-                parameters.Add($"{parameter.Attribute}{parameter.Modifier}{parameter.Type} {csName}");
+                string importType = parameter.ImportType.Length is 0 ? parameter.Type : parameter.ImportType;
+                parameters.Add($"{parameter.Attribute}{parameter.Modifier}{importType} {csName}");
                 if (!hiddenParameters.Contains(i))
                 {
                     ParameterModel model = new(csName, parameter);

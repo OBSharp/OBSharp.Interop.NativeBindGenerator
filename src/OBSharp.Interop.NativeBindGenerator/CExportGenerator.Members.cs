@@ -59,6 +59,12 @@ internal sealed partial class CExportGenerator
         return result.Length is 0 || char.IsDigit(result[0]) ? "_" + result : result;
     }
 
+    /// <summary>
+    /// 去掉可空注解，用于按具体类型查找归属。
+    /// </summary>
+    private static string NonNullableType(string type)
+        => type.EndsWith('?') ? type[..^1] : type;
+
     private void BuildMembers()
     {
         Dictionary<string, List<(FunctionModel Function, string Remainder)>> groups = [];
@@ -66,17 +72,18 @@ internal sealed partial class CExportGenerator
         HashSet<FunctionModel> grouped = [];
         foreach (FunctionModel function in _models)
         {
+            // 可空句柄参数在托管签名里是 Xxx?，归属判断仍需用去掉 ? 的具体类型
             if (function.Parameters is not [{ } first, ..]
-                || first.Type.Attribute.Length is not 0
                 || first.Type.Modifier.Length is not 0
-                || !_owners.TryGetValue(first.Type.Type, out (string CName, bool IsHandle) owner)
+                || !_owners.TryGetValue(NonNullableType(first.Type.Type), out (string CName, bool IsHandle) owner)
                 || !function.Name.StartsWith(owner.CName + "_", StringComparison.Ordinal)
                 || function.Name.Length == owner.CName.Length + 1)
             {
                 continue;
             }
 
-            string typeName = owner.IsHandle ? first.Type.Type : first.Type.Type[..^1];
+            string firstType = NonNullableType(first.Type.Type);
+            string typeName = owner.IsHandle ? firstType : firstType[..^1];
             _functionOwners[function.Name] = typeName;
             if (!groups.TryGetValue(typeName, out var list))
                 groups[typeName] = list = [];

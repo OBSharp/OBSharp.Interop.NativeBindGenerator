@@ -138,12 +138,15 @@ NativeBindGenerator \
 | `--four-byte-boolean` | 关闭 | 将 `bool` 按 4 字节 `UnmanagedType.Bool` 封送；默认按 1 字节 `UnmanagedType.I1`。 |
 | `--string-marshaller` | 默认 UTF-8 封送 | 为 `const char*` 参数指定自定义 marshaller 类型名。 |
 | `--return-string-marshaller` | 默认 UTF-8 封送 | 为 `const char*` 返回值指定自定义 marshaller 类型名。 |
+| `--nullable-handle-marshaller` | 默认关闭 | 为句柄参数指定可空 marshaller 类型名；指定后句柄参数生成 `Xxx?`，托管 `null` 映射为原生 NULL。 |
 | `--cpp-redirect` | 关闭 | 生成 C++ 类的 C 式 native 转发代码，并据此生成 C# 绑定。 |
 | `--qt` | 关闭 | 启用 Qt 特殊处理；需配合 `--cpp-redirect`。 |
 | `--native-output` | `generated/native` | `--cpp-redirect` 的 native 文件输出目录。 |
 | `--native-name` | `cpp_exports` | native 生成文件的基名，不含扩展名。 |
 
 自定义 marshaller 参数只需填写类型名，例如 `MyStringMarshaller`；生成代码会使用 `MarshalUsing(typeof(MyStringMarshaller))`。自定义类型必须能被生成后的 C# 代码访问，并符合 .NET interop marshalling 的要求。
+
+`--nullable-handle-marshaller` 遵循同样的填写方式。指定后，句柄参数在包装 API 中变成 `Xxx?`，导入声明则使用 `[MarshalUsing(typeof(该类型))] SafeHandle?`，这样同一个 marshaller 可以覆盖所有生成的句柄类型；marshaller 需按 `[CustomMarshaller(typeof(SafeHandle), MarshalMode.ManagedToUnmanagedIn, typeof(...))]` 声明。
 
 ## 类型映射概览
 
@@ -155,7 +158,7 @@ NativeBindGenerator \
 - `bool` 参数和返回值默认使用 1 字节封送；`--four-byte-boolean` 可切换为 4 字节封送。
 - 函数指针生成为 `delegate* unmanaged`；数组以指针形式表示。
 - 完整定义的结构体、联合体和枚举会生成对应 C# 类型；结构体中的定长数组使用 `InlineArray`。
-- 对象及不透明结构体指针可生成为 `SafeHandle`。符合常见释放函数形式的声明（例如接收单个不透明指针、返回 `void` 且函数名包含 `destroy`、`free`、`release`、`close` 或 `delete`）可用于关联句柄释放操作。
+- 对象及不透明结构体指针可生成为 `SafeHandle`。符合常见释放函数形式的声明（例如接收单个不透明指针、返回 `void` 且函数名包含 `destroy`、`free`、`release`、`close` 或 `delete`）可用于关联句柄释放操作。句柄参数默认生成 `Xxx`；指定 `--nullable-handle-marshaller` 后生成 `Xxx?`，允许把托管 `null` 传给原生 NULL。
 
 ### C++ 转发
 

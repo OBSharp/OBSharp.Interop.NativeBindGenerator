@@ -35,6 +35,9 @@ public class RootCommand : ICExportGeneratorOptions
     [CliOption(Description = "const char* 返回值使用的自定义 marshaller 类型名，默认 LPUTF8Str")]
     public string ReturnStringMarshaller { get; set; } = "";
 
+    [CliOption(Description = "可空句柄参数（Xxx? ↔ 原生 NULL）使用的自定义 marshaller 类型名；指定后句柄参数生成为 Xxx? 并附加 MarshalUsing")]
+    public string NullableHandleMarshaller { get; set; } = "";
+
     [CliOption(Description = "把 --header 中的 C++ 类自动转发为 C 式导出（生成 native 代码），再据此生成 C# 绑定")]
     public bool CppRedirect { get; set; }
 
