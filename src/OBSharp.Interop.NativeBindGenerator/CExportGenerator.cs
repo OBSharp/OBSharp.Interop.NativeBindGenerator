@@ -13,6 +13,16 @@ internal sealed unsafe partial class CExportGenerator(ICExportGeneratorOptions o
     internal const string QtArraySuffix = "__cppm_qt_array";
     internal const string QtCountName = "__cppm_qt_count";
 
+    /// <summary>
+    /// <c>--cpp-redirect</c> 为 qfloat16 生成的 C 桥接类型名；C# 侧映射为 <see cref="Half"/>。
+    /// </summary>
+    internal const string HalfBridgeType = "nbg_half";
+
+    /// <summary>
+    /// <c>--cpp-redirect</c> 为 GUID 生成的 C 桥接类型名；C# 侧映射为 <see cref="Guid"/>。
+    /// </summary>
+    internal const string GuidBridgeType = "nbg_guid";
+
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private delegate CXChildVisitResult ChildVisitor(CXCursor cursor, CXCursor parent, void* clientData);
 
@@ -210,6 +220,7 @@ internal sealed unsafe partial class CExportGenerator(ICExportGeneratorOptions o
                 or CXCursorKind.CXCursor_EnumDecl)
                 || clang.isCursorDefinition(cursor) is 0
                 || OpaquePointerTypes.ContainsKey(clang.getCursorSpelling(cursor).ToString())
+                || WellKnownRecordName(cursor) is not null
                 || (IsAnonymous(cursor) && !_anonymousNames.ContainsKey(KeyOf(cursor))))
             {
                 continue;

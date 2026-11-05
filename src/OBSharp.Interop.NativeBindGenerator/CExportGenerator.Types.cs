@@ -96,6 +96,9 @@ internal sealed unsafe partial class CExportGenerator
             "size_t" or "uintptr_t" => "nuint",
             "ptrdiff_t" or "ssize_t" or "intptr_t" => "nint",
             "wchar_t" => "char",
+            // --cpp-redirect 生成的桥接类型
+            HalfBridgeType => "Half",
+            GuidBridgeType => "Guid",
             _ => FixedWidthPattern().Match(name) is { Success: true } match
                 ? FixedWidthName(match.Groups[1].Length is not 0, match.Groups[2].Value)
                 : null,
@@ -182,7 +185,7 @@ internal sealed unsafe partial class CExportGenerator
                 ? new("bool", $"[MarshalAs(UnmanagedType.{(options.FourByteBoolean ? "Bool" : "I1")})] ")
                 : new("byte"),
             CXTypeKind.CXType_Enum => new(EnumName(clang.getTypeDeclaration(shape))),
-            CXTypeKind.CXType_Record => new(RecordName(clang.getTypeDeclaration(shape))),
+            CXTypeKind.CXType_Record => new(RecordTypeName(shape)),
             CXTypeKind.CXType_Pointer => MapPointer(shape, position),
             CXTypeKind.CXType_ConstantArray or CXTypeKind.CXType_IncompleteArray or CXTypeKind.CXType_VariableArray 
                 => new(MapType(clang.getArrayElementType(shape), TypePosition.Nested).Type + "*"),
@@ -212,6 +215,13 @@ internal sealed unsafe partial class CExportGenerator
 
         if (position is TypePosition.Field)
             return new("nint");
+
+        // 已知值类型（GUID、qfloat16）的指针直接映射为对应托管类型的指针，而不是 SafeHandle
+        if (peeled.kind is CXTypeKind.CXType_Record
+            && WellKnownRecordName(clang.getTypeDeclaration(peeled)) is { } knownRecord)
+        {
+            return new(knownRecord + "*");
+        }
 
         if (pointeeWellKnown is null)
         {
@@ -442,6 +452,24 @@ internal sealed unsafe partial class CExportGenerator
     }
 
     // ---- 结构体与联合体 ----
+
+    /// <summary>
+    /// 有标准托管对应物的原生记录类型：Windows 的 <c>_GUID</c> 与 Qt 的 <c>qfloat16</c>。
+    /// 它们的布局分别与 <see cref="Guid"/>、<see cref="Half"/> 一致。
+    /// </summary>
+    private static string? WellKnownRecordName(CXCursor declaration)
+        => clang.getCursorSpelling(declaration).ToString() switch
+        {
+            "_GUID" or "GUID" or GuidBridgeType => "Guid",
+            "qfloat16" or HalfBridgeType => "Half",
+            _ => null,
+        };
+
+    private string RecordTypeName(CXType shape)
+    {
+        CXCursor declaration = clang.getTypeDeclaration(shape);
+        return WellKnownRecordName(declaration) ?? RecordName(declaration);
+    }
 
     private string RecordName(CXCursor declaration)
     {

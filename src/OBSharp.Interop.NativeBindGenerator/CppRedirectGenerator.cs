@@ -219,7 +219,8 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
 
                 case CXCursorKind.CXCursor_ClassDecl:
                 case CXCursorKind.CXCursor_StructDecl:
-                    if (clang.isCursorDefinition(cursor) is 0
+                    if (IsWellKnownValueType(cursor)
+                        || clang.isCursorDefinition(cursor) is 0
                         || !IsInHeaders(cursor)
                         || HasTemplateArguments(cursor)
                         || !IsVisibleNestedType(cursor)
@@ -253,6 +254,13 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
             }
         }
     }
+
+    /// <summary>
+    /// Windows 的 <c>_GUID</c> 与 Qt 的 <c>qfloat16</c> 分别有标准托管对应物 <c>Guid</c>、<c>Half</c>，
+    /// 以位模式桥接类型按值传递，而不是生成不透明的 SafeHandle 类。
+    /// </summary>
+    private static bool IsWellKnownValueType(CXCursor cursor)
+        => Spelling(cursor) is "_GUID" or "qfloat16";
 
     private static bool IsVisibleNestedType(CXCursor cursor)
     {
@@ -685,6 +693,9 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
                     if (options.Qt && IsQtList(pointeeCanonical))
                         return ConvertValue(pointeeCanonical, name);
 
+                    if (IsHalf(pointeeCanonical) || IsGuid(pointeeCanonical))
+                        return ConvertValue(pointeeCanonical, name);
+
                     if (pointeeCanonical.kind is CXTypeKind.CXType_Record
                         && ClassOf(pointeeCanonical) is null)
                     {
@@ -707,6 +718,22 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
                 if (ArithName(pointee) is { } arith)
                     return new([new(arith + "*", arith + "*", name)], "*" + name);
 
+                if (IsHalf(pointeeCanonical))
+                {
+                    _needsHalf = true;
+                    return new(
+                        [new(CExportGenerator.HalfBridgeType + "*", "uint16_t*", name)],
+                        $"*reinterpret_cast<{NormalizedSpelling(pointeeCanonical)}*>({name})");
+                }
+
+                if (IsGuid(pointeeCanonical))
+                {
+                    _needsGuid = true;
+                    return new(
+                        [new(CExportGenerator.GuidBridgeType + "*", "cppm_guid*", name)],
+                        $"*reinterpret_cast<{NormalizedSpelling(pointeeCanonical)}*>({name})");
+                }
+
                 if (pointeeCanonical.kind is CXTypeKind.CXType_Record)
                 {
                     OpaquePointerInfo opaque = OpaquePointerOf(pointeeCanonical);
@@ -728,6 +755,22 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
 
                 if (ArithName(pointee) is { } arith)
                     return new([new($"{qualifier}{arith}*", $"{qualifier}{arith}*", name)], name);
+
+                if (IsHalf(pointeeCanonical))
+                {
+                    _needsHalf = true;
+                    return new(
+                        [new($"{qualifier}{CExportGenerator.HalfBridgeType}*", $"{qualifier}uint16_t*", name)],
+                        $"reinterpret_cast<{qualifier}{NormalizedSpelling(pointeeCanonical)}*>({name})");
+                }
+
+                if (IsGuid(pointeeCanonical))
+                {
+                    _needsGuid = true;
+                    return new(
+                        [new($"{qualifier}{CExportGenerator.GuidBridgeType}*", $"{qualifier}cppm_guid*", name)],
+                        $"reinterpret_cast<{qualifier}{NormalizedSpelling(pointeeCanonical)}*>({name})");
+                }
 
                 if (ClassOf(pointeeCanonical) is { } info)
                 {
@@ -757,6 +800,22 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
 
     private ParamPlan ConvertValue(CXType canonical, string name)
     {
+        if (IsHalf(canonical))
+        {
+            _needsHalf = true;
+            return new(
+                [new(CExportGenerator.HalfBridgeType, "uint16_t", name)],
+                $"cppm::from_half_bits<{NormalizedSpelling(canonical)}>({name})");
+        }
+
+        if (IsGuid(canonical))
+        {
+            _needsGuid = true;
+            return new(
+                [new(CExportGenerator.GuidBridgeType, "cppm_guid", name)],
+                $"cppm::from_guid_bits<{NormalizedSpelling(canonical)}>({name})");
+        }
+
         if (options.Qt
             && IsQString(canonical))
             return new([new("const char*", "const char*", name)], $"QString::fromUtf8({name})");
@@ -887,6 +946,18 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
                         ? x => $"reinterpret_cast<void*>({x})"
                         : x => $"cppm::ptr_to_void({x})");
             }
+        }
+
+        if (IsHalf(canonical))
+        {
+            _needsHalf = true;
+            return new(CExportGenerator.HalfBridgeType, "uint16_t", x => $"cppm::to_half_bits({x})");
+        }
+
+        if (IsGuid(canonical))
+        {
+            _needsGuid = true;
+            return new(CExportGenerator.GuidBridgeType, "cppm_guid", x => $"cppm::to_guid_bits({x})");
         }
 
         if (options.Qt
@@ -1112,9 +1183,40 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
 
     private readonly Dictionary<string, string[]> _sourceLines = [];
     private bool _connectionUsed;
+    private bool _needsHalf;
+    private bool _needsGuid;
 
     private static bool IsQString(CXType canonical)
         => clang.getTypeSpelling(canonical).ToString().Replace("const ", "").Trim() is "QString";
+
+    /// <summary>
+    /// 去掉 const/volatile、class/struct 和全局限定符后的类型名。
+    /// </summary>
+    private static string NormalizedSpelling(CXType type)
+    {
+        string spelling = clang.getTypeSpelling(type).ToString().Trim();
+        bool changed = true;
+        while (changed)
+        {
+            changed = false;
+            foreach (string prefix in (string[])["const ", "volatile ", "class ", "struct "])
+            {
+                if (spelling.StartsWith(prefix, StringComparison.Ordinal))
+                {
+                    spelling = spelling[prefix.Length..].TrimStart();
+                    changed = true;
+                }
+            }
+        }
+
+        return spelling.TrimStart(':');
+    }
+
+    private static bool IsHalf(CXType canonical)
+        => NormalizedSpelling(canonical) is "qfloat16";
+
+    private static bool IsGuid(CXType canonical)
+        => NormalizedSpelling(canonical) is "_GUID" or "GUID";
 
     // 未被发现（不在 --header 中）的 QObject 派生类，如 QObject 本身，按不透明指针传递
     private bool IsForeignQObject(CXType canonical)
@@ -1472,6 +1574,7 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
         string opaquePointers = string.Join("\n", _opaquePointers.Values
             .OrderBy(pointer => pointer.CName, StringComparer.Ordinal)
             .Select(pointer => $"typedef struct {pointer.CName} {{ unsigned char _opaque; }} {pointer.CName};"));
+        string bridgeTypes = BuildBridgeTypeDeclarations();
 
         string declarations = string.Join("\n", _headerDeclarations);
 
@@ -1495,6 +1598,8 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
             extern "C" {
             #endif
 
+            {{bridgeTypes}}
+
             {{classes}}
 
             {{enums}}
@@ -1509,6 +1614,29 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
             #endif
 
             """);
+    }
+
+    // 位模式桥接类型的 C 声明：C# 侧分别映射为 Half、Guid。
+    private string BuildBridgeTypeDeclarations()
+    {
+        List<string> declarations = [];
+        if (_needsHalf)
+            declarations.Add($"typedef uint16_t {CExportGenerator.HalfBridgeType};");
+
+        if (_needsGuid)
+        {
+            declarations.Add($$"""
+                typedef struct {{CExportGenerator.GuidBridgeType}}
+                {
+                    uint32_t data1;
+                    uint16_t data2;
+                    uint16_t data3;
+                    uint8_t data4[8];
+                } {{CExportGenerator.GuidBridgeType}};
+                """);
+        }
+
+        return string.Join("\n", declarations);
     }
 
     private static string EnumDeclaration(EnumInfo info)

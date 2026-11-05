@@ -39,8 +39,58 @@ internal static class CppMarshaller
         #endif
         #endif
 
+        // C 与 C++ 之间的 GUID 桥接类型；布局与 Windows GUID、.NET System.Guid 一致（16 字节）。
+        struct cppm_guid
+        {
+            std::uint32_t data1;
+            std::uint16_t data2;
+            std::uint16_t data3;
+            std::uint8_t data4[8];
+        };
+
+        static_assert(sizeof(cppm_guid) == 16, "cppm_guid 必须与 GUID 一样是 16 字节");
+
         namespace cppm
         {
+            // ---- 位模式桥接 ----
+            // qfloat16、GUID 没有公开的位访问接口，用 memcpy 在其对象表示与 C 基本类型之间搬运。
+
+            template <class T>
+            inline T from_half_bits(std::uint16_t bits)
+            {
+                static_assert(sizeof(T) == sizeof(std::uint16_t), "qfloat16 必须是 2 字节");
+                T value{};
+                std::memcpy(&value, &bits, sizeof(bits));
+                return value;
+            }
+
+            template <class T>
+            inline std::uint16_t to_half_bits(const T& value)
+            {
+                static_assert(sizeof(T) == sizeof(std::uint16_t), "qfloat16 必须是 2 字节");
+                std::uint16_t bits = 0;
+                std::memcpy(&bits, &value, sizeof(bits));
+                return bits;
+            }
+
+            template <class T>
+            inline T from_guid_bits(const cppm_guid& bits)
+            {
+                static_assert(sizeof(T) == sizeof(cppm_guid), "GUID 必须是 16 字节");
+                T value{};
+                std::memcpy(&value, &bits, sizeof(bits));
+                return value;
+            }
+
+            template <class T>
+            inline cppm_guid to_guid_bits(const T& value)
+            {
+                static_assert(sizeof(T) == sizeof(cppm_guid), "GUID 必须是 16 字节");
+                cppm_guid bits{};
+                std::memcpy(&bits, &value, sizeof(bits));
+                return bits;
+            }
+
             inline void* allocate(size_t size)
             {
         #if defined(_WIN32)
