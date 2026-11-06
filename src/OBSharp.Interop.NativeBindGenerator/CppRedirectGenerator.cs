@@ -56,6 +56,28 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
         "int8_t", "int16_t", "int32_t", "int64_t", "uint8_t", "uint16_t", "uint32_t", "uint64_t",
     ];
 
+    /// <summary>
+    /// 公共声明（桥接类型、枚举、不透明指针、free_memory、Qt 连接销毁）所属的分组键；
+    /// 其余分组键为类的 C 名，每个键对应一对拆分的 <c>.h</c>/<c>.cpp</c>。
+    /// </summary>
+    private const string CommonOwner = "";
+
+    /// <summary>
+    /// 按所属类归集的导出声明与定义，避免把全部导出堆进一个巨大的翻译单元。
+    /// </summary>
+    private sealed class ExportGroup
+    {
+        public List<string> HeaderTypedefs { get; } = [];
+
+        public List<string> SourceTypedefs { get; } = [];
+
+        public List<string> HeaderDeclarations { get; } = [];
+
+        public List<string> SourceDefinitions { get; } = [];
+
+        public int Count => SourceDefinitions.Count;
+    }
+
     private readonly Dictionary<string, ClassInfo> _classes = [];
     private readonly Dictionary<string, EnumInfo> _enums = [];
     private readonly Dictionary<string, OpaquePointerInfo> _opaquePointers = [];
@@ -63,12 +85,23 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
     private readonly Dictionary<string, string> _opaqueTemplateNames = [];
     private readonly HashSet<string> _usedClasses = [];
     private readonly HashSet<string> _cNames = [];
-    private readonly List<string> _headerDeclarations = [];
-    private readonly List<string> _sourceDefinitions = [];
-    private readonly List<string> _sourceTypedefs = [];
+    private readonly Dictionary<string, ExportGroup> _groups = new(StringComparer.Ordinal);
     private readonly Dictionary<string, string> _originalSignatures = new(StringComparer.Ordinal);
     private HashSet<string> _headers = [];
-    private string _headerText = "";
+    private string _currentOwner = CommonOwner;
+    private int _sourceDefinitionCount;
+
+    /// <summary>
+    /// 生成的原生文件：相对 native 产物目录的路径与内容。
+    /// </summary>
+    private sealed record NativeFile(string RelativePath, string Content);
+
+    private readonly List<NativeFile> _nativeFiles = [];
+
+    /// <summary>
+    /// 交给 <see cref="CExportGenerator"/> 重新解析的全部生成头文件（绝对路径）。
+    /// </summary>
+    private readonly List<string> _generatedHeaders = [];
 
     public void Generate()
     {
@@ -104,9 +137,9 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
                     Discover(CExportGenerator.ChildrenOf(clang.getTranslationUnitCursor(tu)));
                     foreach (ClassInfo info in _classes.Values.OrderBy(c => c.CName, StringComparer.Ordinal))
                     {
-                        int before = _sourceDefinitions.Count;
+                        int before = _sourceDefinitionCount;
                         BindClass(info);
-                        if (_sourceDefinitions.Count > before)
+                        if (_sourceDefinitionCount > before)
                             _usedClasses.Add(Usr(info.Cursor));
                     }
 
@@ -114,7 +147,7 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
                         BindConnectionDestroy();
 
                     // 头文件文本依赖仍存活的游标，必须在翻译单元释放之前生成
-                    _headerText = BuildHeader();
+                    BuildNativeFiles(headers);
                 }
                 finally
                 {
@@ -131,24 +164,28 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
             Directory.Delete(staging, recursive: true);
         }
 
-        if (_sourceDefinitions.Count is 0)
+        if (_sourceDefinitionCount is 0)
             throw new InvalidOperationException("指定头文件中没有找到可转发的 C++ 类");
 
         string nativeDirectory = Path.GetFullPath(options.NativeOutput);
         Directory.CreateDirectory(nativeDirectory);
-        string headerPath = Path.Combine(nativeDirectory, options.NativeName + ".h");
+        RemoveStaleNativeFiles(nativeDirectory);
         // 一律 UTF-8 无 BOM；用 MSVC 编译时请加 /utf-8
         UTF8Encoding utf8 = new(false);
-        File.WriteAllText(
-            Path.Combine(nativeDirectory, CppMarshaller.FileName),
-            CppMarshaller.Source.Replace("\r\n", "\n") + "\n",
-            utf8);
-        File.WriteAllText(headerPath, _headerText, utf8);
-        File.WriteAllText(Path.Combine(nativeDirectory, options.NativeName + ".cpp"), BuildSource(headers), utf8);
-        Console.WriteLine($"生成了 {_sourceDefinitions.Count} 个 C 式导出（{nativeDirectory}）。");
+        foreach (NativeFile file in _nativeFiles)
+        {
+            string path = Path.Combine(nativeDirectory, file.RelativePath);
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            File.WriteAllText(path, file.Content, utf8);
+        }
+
+        WriteManifest(nativeDirectory);
+
+        Console.WriteLine(
+            $"生成了 {_sourceDefinitionCount} 个 C 式导出、{_nativeFiles.Count} 个 native 文件（{nativeDirectory}）。");
 
         // 对生成的 C 头文件再走一遍 C 导出流程；其中是 C++ 翻译单元，clang 参数仍由用户提供
-        options.Header = [headerPath];
+        options.Header = [.. _generatedHeaders];
         new CExportGenerator(options)
         {
             TuFileName = "exports.cpp",
@@ -160,6 +197,53 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
                 pointer => (pointer.ManagedType, pointer.CppName, pointer.DeclarationKey, pointer.Declaration),
                 StringComparer.Ordinal),
         }.Generate();
+    }
+
+    /// <summary>
+    /// 记录本次生成的文件清单的文件名（放在 native 产物目录内）。
+    /// </summary>
+    private const string ManifestFileName = "native_manifest.txt";
+
+    /// <summary>
+    /// 写入生成清单，供下次运行精确清理旧产物；不使用通配删除，避免误删目录中用户自己的文件。
+    /// </summary>
+    private void WriteManifest(string nativeDirectory)
+    {
+        string[] relativePaths = [.. _nativeFiles
+            .Select(file => file.RelativePath)
+            .Append(ManifestFileName)
+            .OrderBy(path => path, StringComparer.Ordinal)];
+        File.WriteAllLines(
+            Path.Combine(nativeDirectory, ManifestFileName),
+            relativePaths,
+            new UTF8Encoding(false));
+    }
+
+    /// <summary>
+    /// 按上次的清单删除本次不再产生的生成文件，避免类改名或删除后残留旧文件继续参与编译。
+    /// 只删除清单里列出的、位于输出目录内的文件。
+    /// </summary>
+    private static void RemoveStaleNativeFiles(string nativeDirectory)
+    {
+        string manifestPath = Path.Combine(nativeDirectory, ManifestFileName);
+        if (!File.Exists(manifestPath))
+            return;
+
+        string root = Path.GetFullPath(nativeDirectory);
+        foreach (string line in File.ReadAllLines(manifestPath))
+        {
+            string relative = line.Trim();
+            if (relative.Length is 0)
+                continue;
+
+            string candidate = Path.GetFullPath(Path.Combine(root, relative));
+            // 防御清单被篡改：只处理输出目录内的文件
+            if (!candidate.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            if (File.Exists(candidate))
+                File.Delete(candidate);
+        }
     }
 
     private static string NormalizePath(string path)
@@ -1053,6 +1137,20 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
 
     private void BindClass(ClassInfo info)
     {
+        // 该类的全部导出写入以类名命名的 .h/.cpp 对
+        _currentOwner = info.CName;
+        try
+        {
+            BindClassCore(info);
+        }
+        finally
+        {
+            _currentOwner = CommonOwner;
+        }
+    }
+
+    private void BindClassCore(ClassInfo info)
+    {
         CXCursor cursor = info.Cursor;
         List<CXCursor> children = CExportGenerator.ChildrenOf(cursor);
         string selfType = info.CppName;
@@ -1386,8 +1484,9 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
             ? $"static_cast<void ({declaringName}::*)({string.Join(", ", cppTypes)})>(&{declaringName}::{name})"
             : $"&{declaringName}::{name}";
 
-        _headerDeclarations.Add($"typedef void (CPPM_CALL *{callbackName})({string.Join(", ", hTypes)});");
-        _sourceTypedefs.Add($"typedef void (CPPM_CALL *{callbackName})({string.Join(", ", cTypes)});");
+        ExportGroup group = GroupOf(_currentOwner);
+        group.HeaderTypedefs.Add($"typedef void (CPPM_CALL *{callbackName})({string.Join(", ", hTypes)});");
+        group.SourceTypedefs.Add($"typedef void (CPPM_CALL *{callbackName})({string.Join(", ", cTypes)});");
         _connectionUsed = true;
 
         string sender = $"static_cast<{info.CppName}*>({SelfName})";
@@ -1544,13 +1643,23 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
             ? $"{expression};"
             : $"return {returnPlan.Wrap(expression)};";
 
-        _headerDeclarations.Add($"{returnPlan.H} CPPM_CALL {cName}({hParameters});");
-        _sourceDefinitions.Add(Lf($$"""
+        ExportGroup group = GroupOf(_currentOwner);
+        group.HeaderDeclarations.Add($"{returnPlan.H} CPPM_CALL {cName}({hParameters});");
+        group.SourceDefinitions.Add(Lf($$"""
             CPPM_EXPORT {{returnPlan.C}} CPPM_CALL {{cName}}({{cParameters}})
             {
                 {{body}}
             }
             """));
+        _sourceDefinitionCount++;
+    }
+
+    private ExportGroup GroupOf(string owner)
+    {
+        if (!_groups.TryGetValue(owner, out ExportGroup? group))
+            _groups[owner] = group = new();
+
+        return group;
     }
 
     // 源文件可能是 CRLF，原始字符串中的换行随之变化，统一规整为 LF
@@ -1559,7 +1668,65 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
 
     // ---- 输出 ----
 
-    private string BuildHeader()
+    /// <summary>
+    /// 生成按类拆分的 native 产物：
+    /// <list type="bullet">
+    /// <item><c>&lt;native-name&gt;.h</c> / <c>&lt;native-name&gt;.cpp</c>：公共声明（桥接类型、枚举、不透明指针、free_memory）与类句柄前置声明；</item>
+    /// <item><c>&lt;类名&gt;.h</c> / <c>&lt;类名&gt;.cpp</c>：该类的导出声明与实现，各为一个翻译单元。</item>
+    /// </list>
+    /// 分开的翻译单元让编译器与 Roslyn 都能并行处理，避免单个巨大文件拖慢甚至引发编译失败。
+    /// </summary>
+    private void BuildNativeFiles(string[] headers)
+    {
+        string includes = string.Join("\n", headers.Select(header =>
+            $"#include \"{header.Replace('\\', '/')}\""));
+
+        // 公共头：所有拆分文件都包含它，因此这里集中放置共享声明
+        string commonHeader = BuildCommonHeader();
+        _nativeFiles.Add(new(options.NativeName + ".h", commonHeader));
+        _generatedHeaders.Add(Path.Combine(
+            Path.GetFullPath(options.NativeOutput), options.NativeName + ".h"));
+
+        // 公共实现：free_memory 与 Qt 连接销毁
+        _nativeFiles.Add(new(
+            options.NativeName + ".cpp",
+            BuildCommonSource(includes)));
+
+        // 同一个头文件里可能出现清理后同名的类（如 a::b 与 a_b），文件名需去重
+        HashSet<string> usedBaseNames = [with(StringComparer.OrdinalIgnoreCase)];
+        usedBaseNames.Add(options.NativeName);
+
+        foreach ((string owner, ExportGroup group) in _groups
+            .Where(entry => entry.Key != CommonOwner && entry.Value.Count > 0)
+            .OrderBy(entry => entry.Key, StringComparer.Ordinal))
+        {
+            string baseName = FileBaseName(owner);
+            string unique = baseName;
+            for (int suffix = 2; !usedBaseNames.Add(unique); suffix++)
+                unique = $"{baseName}_{suffix}";
+
+            string headerName = unique + ".h";
+            _nativeFiles.Add(new(headerName, BuildGroupHeader(owner, group)));
+            _nativeFiles.Add(new(unique + ".cpp", BuildGroupSource(owner, group, includes)));
+            _generatedHeaders.Add(Path.Combine(Path.GetFullPath(options.NativeOutput), headerName));
+        }
+
+        _nativeFiles.Add(new(CppMarshaller.FileName, CppMarshaller.Source.Replace("\r\n", "\n") + "\n"));
+    }
+
+    /// <summary>
+    /// 文件名主体：只保留字母、数字与下划线，避免命名空间分隔符等字符进入路径。
+    /// </summary>
+    private static string FileBaseName(string owner)
+    {
+        string name = NativeIdentifier(owner);
+        return name.Length is 0 ? "exports" : name;
+    }
+
+    /// <summary>
+    /// 公共头：桥接类型、枚举、不透明指针的前置声明、共享宏与 free_memory 声明。
+    /// </summary>
+    private string BuildCommonHeader()
     {
         string classes = string.Join("\n", _classes.Values
             .Where(c => _usedClasses.Contains(Usr(c.Cursor)))
@@ -1575,8 +1742,6 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
             .OrderBy(pointer => pointer.CName, StringComparer.Ordinal)
             .Select(pointer => $"typedef struct {pointer.CName} {{ unsigned char _opaque; }} {pointer.CName};"));
         string bridgeTypes = BuildBridgeTypeDeclarations();
-
-        string declarations = string.Join("\n", _headerDeclarations);
 
         return Lf($$"""
             // 由 OBSharp.Interop.NativeBindGenerator --cpp-redirect 生成，请勿手工修改。
@@ -1594,6 +1759,15 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
             #endif
             #endif
 
+            // DLL 导出标记；实现文件通过 cpp_marshaller.hpp 也会定义一次，保持相容
+            #ifndef CPPM_EXPORT
+            #if defined(_WIN32)
+            #define CPPM_EXPORT extern "C" __declspec(dllexport)
+            #else
+            #define CPPM_EXPORT extern "C" __attribute__((visibility("default")))
+            #endif
+            #endif
+
             #ifdef __cplusplus
             extern "C" {
             #endif
@@ -1607,11 +1781,91 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
             {{opaquePointers}}
 
             void CPPM_CALL {{FreeMemoryFunctionName}}(void* pointer);
+
+            #ifdef __cplusplus
+            }
+            #endif
+
+            """);
+    }
+
+    /// <summary>
+    /// 公共实现：free_memory 与 Qt 连接销毁。
+    /// 与拆分类文件保持一致，不包含公共头（头文件里的强类型句柄与实现的 <c>void*</c> 签名不同）。
+    /// </summary>
+    private string BuildCommonSource(string includes)
+    {
+        string typedefs = string.Join("\n", GroupOf(CommonOwner).SourceTypedefs);
+        string definitions = string.Join("\n\n",
+            GroupOf(CommonOwner).SourceDefinitions);
+
+        return Lf($$"""
+            // 由 OBSharp.Interop.NativeBindGenerator --cpp-redirect 生成，请勿手工修改。
+            #include "{{CppMarshaller.FileName}}"
+            {{(_connectionUsed ? includes : "")}}
+
+            {{typedefs}}
+
+            CPPM_EXPORT void CPPM_CALL {{FreeMemoryFunctionName}}(void* pointer)
+            {
+                cppm::release(pointer);
+            }
+
+            {{definitions}}
+
+            """);
+    }
+
+    /// <summary>
+    /// 单个类的头文件：包含公共头，再声明该类的全部 C 式导出。
+    /// </summary>
+    private string BuildGroupHeader(string owner, ExportGroup group)
+    {
+        string typedefs = string.Join("\n", group.HeaderTypedefs);
+        string declarations = string.Join("\n", group.HeaderDeclarations);
+
+        return Lf($$"""
+            // 由 OBSharp.Interop.NativeBindGenerator --cpp-redirect 生成，请勿手工修改。
+            // 类：{{owner}}
+            #pragma once
+
+            #include "{{options.NativeName}}.h"
+
+            #ifdef __cplusplus
+            extern "C" {
+            #endif
+
+            {{typedefs}}
+
             {{declarations}}
 
             #ifdef __cplusplus
             }
             #endif
+
+            """);
+    }
+
+    /// <summary>
+    /// 单个类的实现文件：独立翻译单元。
+    /// 刻意<b>不</b>包含该类头文件：头文件里的参数是 <c>demo_Widget*</c> 这类强类型句柄，
+    /// 而实现统一用 <c>void*</c> 承接，同名 extern "C" 函数签名不同会直接报错。
+    /// 头文件只供使用方（以及 C# 绑定生成）读取。
+    /// </summary>
+    private static string BuildGroupSource(string owner, ExportGroup group, string includes)
+    {
+        string typedefs = string.Join("\n", group.SourceTypedefs);
+        string definitions = string.Join("\n\n", group.SourceDefinitions);
+
+        return Lf($$"""
+            // 由 OBSharp.Interop.NativeBindGenerator --cpp-redirect 生成，请勿手工修改。
+            // 类：{{owner}}
+            #include "{{CppMarshaller.FileName}}"
+            {{includes}}
+
+            {{typedefs}}
+
+            {{definitions}}
 
             """);
     }
@@ -1651,28 +1905,5 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
             {{constants}}
             } {{info.CName}};
             """;
-    }
-
-    private string BuildSource(string[] headers)
-    {
-        string includes = string.Join("\n", headers.Select(h => $"#include \"{h.Replace('\\', '/')}\""));
-        string definitions = string.Join("\n\n", _sourceDefinitions);
-        string typedefs = string.Join("\n", _sourceTypedefs);
-
-        return Lf($$"""
-            // 由 OBSharp.Interop.NativeBindGenerator --cpp-redirect 生成，请勿手工修改。
-            #include "{{CppMarshaller.FileName}}"
-            {{includes}}
-
-            {{typedefs}}
-
-            CPPM_EXPORT void CPPM_CALL {{FreeMemoryFunctionName}}(void* pointer)
-            {
-                cppm::release(pointer);
-            }
-
-            {{definitions}}
-
-            """);
     }
 }

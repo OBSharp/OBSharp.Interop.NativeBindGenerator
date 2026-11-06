@@ -101,14 +101,19 @@ NativeBindGenerator \
   -std=c++20
 ```
 
-此模式会在 `generated/native` 下生成：
+此模式会在 `generated/native` 下按类拆分为多个文件：
 
-- `widget_exports.h` 和 `widget_exports.cpp`：C 式导出声明与实现。
+- `<native-name>.h`：公共头文件，含桥接类型、枚举、不透明指针句柄以及全部类句柄的前置声明，由所有拆分文件包含。
+- `<native-name>.cpp`：公共实现，仅含 `free_memory`（以及启用 `--qt` 时的连接销毁）。
+- `<类名>.h` 和 `<类名>.cpp`：每个类各一对，分别声明和实现该类的全部 C 式导出。类名取 C 名（命名空间以 `_` 连接，如 `demo_Widget`），非法字符替换为 `_`。
 - `cpp_marshaller.hpp`：包装代码使用的类型转换和内存管理工具。
+- `native_manifest.txt`：本次生成的文件清单，供下次运行清理过期产物。
 
-生成的 native 源码需要使用目标库对应的编译器、头文件、宏和链接设置构建成原生库。`--library-name` 应与最终加载的库名称相符。
+生成的 native 源码需要使用目标库对应的编译器、头文件、宏和链接设置构建成原生库。`--library-name` 应与最终加载的库名称相符。编译时把该目录下的所有 `*.cpp` 一并加入即可。
 
-native 产物刻意保持为单个 `.cpp` 翻译单元（unity 构建）：C++ 编译时间的绝大部分消耗在解析原始头文件与模板上，若按函数拆成多个翻译单元，每个文件都要重复解析一遍全部头文件，通常反而更慢。需要并行编译时，可自行按导出函数把 `*.cpp` 拆分到多个文件（各文件重复包含同一组头文件即可）。
+按类拆分是为了避免单个超大翻译单元：类多、方法多时，一个巨大 `.cpp` 会触发编译器的对象文件段数、内存或编译时间上限，甚至直接编译失败。拆分后每个 `.cpp` 只包含自己那一对头文件与原始头文件，既能并行编译，也便于按类增量构建与定位错误。代价是每个翻译单元都要重新解析一遍原始头文件，因此对少量类的头文件，单文件 unity 构建可能仍更快；如需极致编译时间，可把若干类文件合并编译。
+
+> 注意：拆分出的 `<类名>.cpp` 不包含同名 `.h`。头文件里的句柄参数是 `demo_Widget*` 这类强类型指针，而实现统一用 `void*` 承接；同名 `extern "C"` 函数若两处签名不同会直接编译报错，因此头文件只供使用方和 C# 绑定生成读取。
 
 ### Qt 支持
 
@@ -142,7 +147,7 @@ NativeBindGenerator \
 | `--cpp-redirect` | 关闭 | 生成 C++ 类的 C 式 native 转发代码，并据此生成 C# 绑定。 |
 | `--qt` | 关闭 | 启用 Qt 特殊处理；需配合 `--cpp-redirect`。 |
 | `--native-output` | `generated/native` | `--cpp-redirect` 的 native 文件输出目录。 |
-| `--native-name` | `cpp_exports` | native 生成文件的基名，不含扩展名。 |
+| `--native-name` | `cpp_exports` | native 公共文件（公共头/公共实现）的基名；各类按类名单独命名。 |
 
 自定义 marshaller 参数只需填写类型名，例如 `MyStringMarshaller`；生成代码会使用 `MarshalUsing(typeof(MyStringMarshaller))`。自定义类型必须能被生成后的 C# 代码访问，并符合 .NET interop marshalling 的要求。
 
