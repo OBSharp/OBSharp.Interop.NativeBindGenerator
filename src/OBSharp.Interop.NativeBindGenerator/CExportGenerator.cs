@@ -80,6 +80,15 @@ internal sealed unsafe partial class CExportGenerator(ICExportGeneratorOptions o
 
     internal string FreeMemoryFunctionName { get; init; } = "cppm_free_memory";
 
+    /// <summary>
+    /// 函数（入口点）→ 该函数所在的原生库名。
+    /// 导出数超过单个 PE 导出表上限时，native 侧会拆成多个库，
+    /// 此处让每个 <c>LibraryImport</c> 指向真正包含它的那个库。
+    /// 未登记的函数回退到 <see cref="ICExportGeneratorOptions.LibraryName"/>。
+    /// </summary>
+    internal IReadOnlyDictionary<string, string> FunctionLibraries { get; init; }
+        = new Dictionary<string, string>(StringComparer.Ordinal);
+
     public void Generate()
     {
         LibClangLoader.Ensure();
@@ -387,7 +396,7 @@ internal sealed unsafe partial class CExportGenerator(ICExportGeneratorOptions o
             /// </summary>
             """;
         string import = $$"""
-                [LibraryImport("{{Escape(options.LibraryName)}}", EntryPoint = "{{Escape(name)}}")]
+                [LibraryImport("{{Escape(LibraryOf(name))}}", EntryPoint = "{{Escape(name)}}")]
                 [UnmanagedCallConv(CallConvs = [typeof({{CallConvType(clang.getFunctionTypeCallingConv(functionType))}})])]
             {{attributes}}    internal static partial {{nativeReturnType.Type}} {{nativeMethodName}}({{string.Join(", ", parameters)}});
             """;
@@ -508,6 +517,14 @@ internal sealed unsafe partial class CExportGenerator(ICExportGeneratorOptions o
                 }
             """;
     }
+
+    /// <summary>
+    /// 该函数所在的原生库名；未登记时回退到 <see cref="ICExportGeneratorOptions.LibraryName"/>。
+    /// </summary>
+    private string LibraryOf(string functionName)
+        => FunctionLibraries.TryGetValue(functionName, out string? library) && library.Length is not 0
+            ? library
+            : options.LibraryName;
 
     private string NativeSignature(CXCursor function, string name)
     {

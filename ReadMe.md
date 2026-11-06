@@ -108,12 +108,66 @@ NativeBindGenerator \
 - `<类名>.h` 和 `<类名>.cpp`：每个类各一对，分别声明和实现该类的全部 C 式导出。类名取 C 名（命名空间以 `_` 连接，如 `demo_Widget`），非法字符替换为 `_`。
 - `cpp_marshaller.hpp`：包装代码使用的类型转换和内存管理工具。
 - `native_manifest.txt`：本次生成的文件清单，供下次运行清理过期产物。
+- `generated-libraries.cmake`：库划分清单（仅当导出数超过单库上限时才有实际意义），供 CMake 为每个库建立独立目标。
 
 生成的 native 源码需要使用目标库对应的编译器、头文件、宏和链接设置构建成原生库。`--library-name` 应与最终加载的库名称相符。编译时把该目录下的所有 `*.cpp` 一并加入即可。
 
 按类拆分是为了避免单个超大翻译单元：类多、方法多时，一个巨大 `.cpp` 会触发编译器的对象文件段数、内存或编译时间上限，甚至直接编译失败。拆分后每个 `.cpp` 只包含自己那一对头文件与原始头文件，既能并行编译，也便于按类增量构建与定位错误。代价是每个翻译单元都要重新解析一遍原始头文件，因此对少量类的头文件，单文件 unity 构建可能仍更快；如需极致编译时间，可把若干类文件合并编译。
 
 > 注意：拆分出的 `<类名>.cpp` 不包含同名 `.h`。头文件里的句柄参数是 `demo_Widget*` 这类强类型指针，而实现统一用 `void*` 承接；同名 `extern "C"` 函数若两处签名不同会直接编译报错，因此头文件只供使用方和 C# 绑定生成读取。
+
+#### 单个库放不下时自动拆成多个库
+
+一个 PE/COFF DLL 的导出表最多容纳 **65,535** 项，超过后链接器直接失败：
+
+```text
+LINK : fatal error LNK1189: 超过 65535 对象的库限制
+```
+
+像 Qt 这样的大项目经 `--cpp-redirect --qt` 展开后会产生 7 万以上导出，单个库必然放不下。此时生成器会把类按容量贪心装箱，拆成多个库：
+
+- **主库**沿用 `--library-name` 的名字（如 `OBSharp.Interop.Qt.Native`）；
+- **附属库**依次追加 `1`、`2`、`3`… 后缀（如 `OBSharp.Interop.Qt.Native1`）；
+- 主库的源码仍在 native 产物根目录，附属库的源码位于 `<库名>/` 子目录；
+- 每个类整体属于一个库，不会被拆开；
+- 生成的 C# 绑定里，每个 `LibraryImport` 指向真正包含该函数的那个库，调用方无需区分。
+
+控制台会打印实际划分，例如：
+
+```text
+生成了 73546 个 C 式导出、1867 个 native 文件（.../native）。
+导出数超过单个库上限 65535，已拆成 2 个原生库：
+  OBSharp.Interop.Qt.Native: 46732 个导出、612 个类（主库）
+  OBSharp.Interop.Qt.Native1: 26814 个导出、321 个类
+```
+
+需要在 CMake 侧为每个库建立独立目标时，消费 `generated-libraries.cmake`：
+
+```cmake
+include("${GEN_DIR}/generated-libraries.cmake")   # 定义 OBSHARP_NATIVE_LIBRARIES
+
+foreach(library IN LISTS OBSHARP_NATIVE_LIBRARIES)
+    string(TOUPPER "${library}" key)
+    string(REGEX REPLACE "[^A-Z0-9]" "_" key "${key}")
+    set(source_dir "${OBSHARP_NATIVE_LIBRARY_${key}_SOURCE_DIR}")
+
+    # 每个库只收自己目录下的 .cpp：主库在根目录，附属库在各自子目录，
+    # 因此这里用 GLOB 而不是 GLOB_RECURSE。
+    file(GLOB sources CONFIGURE_DEPENDS "${source_dir}/*.cpp")
+    add_library(${library} SHARED ${sources})
+    target_compile_features(${library} PRIVATE cxx_std_20)
+    if(MSVC)
+        target_compile_options(${library} PRIVATE /utf-8)
+    endif()
+    target_link_libraries(${library} PRIVATE ${qt_targets})
+endforeach()
+```
+
+单库上限可用环境变量调整（主要用于测试）：
+
+```shell
+OBSHARP_MAX_EXPORTS_PER_LIBRARY=20000
+```
 
 ### Qt 支持
 

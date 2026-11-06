@@ -63,7 +63,20 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
     private const string CommonOwner = "";
 
     /// <summary>
-    /// 按所属类归集的导出声明与定义，避免把全部导出堆进一个巨大的翻译单元。
+    /// 单个 PE 导出表最多容纳的导出项数量。超过后链接器直接报
+    /// <c>LNK1189: 超过 65535 对象的库限制</c>，因此必须拆成多个库。
+    /// 可用环境变量 <c>OBSHARP_MAX_EXPORTS_PER_LIBRARY</c> 覆盖，便于测试与特殊平台调整。
+    /// </summary>
+    private static readonly int MaxExportsPerLibrary = MaxExportsPerLibraryOverride() ?? 65535;
+
+    private static int? MaxExportsPerLibraryOverride()
+        => int.TryParse(Environment.GetEnvironmentVariable("OBSHARP_MAX_EXPORTS_PER_LIBRARY"), out int value)
+            && value > 0
+                ? value
+                : null;
+
+    /// <summary>
+    /// 按类归集的导出；一个类可能被整组塞进某个库，因此这里保持"类"为最小迁移单位。
     /// </summary>
     private sealed class ExportGroup
     {
@@ -75,7 +88,38 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
 
         public List<string> SourceDefinitions { get; } = [];
 
+        /// <summary>
+        /// 该组包含的 C 导出函数名，用于建立函数 → 库的映射。
+        /// </summary>
+        public List<string> FunctionNames { get; } = [];
+
         public int Count => SourceDefinitions.Count;
+    }
+
+    /// <summary>
+    /// 一个原生库：承载一组类的导出，对应一个 <c>.h</c> 与若干 <c>.cpp</c>。
+    /// </summary>
+    private sealed class NativeLibrary(string name, int index)
+    {
+        /// <summary>
+        /// C# 侧 <c>LibraryImport</c> 使用的库名；主库等于 <c>--library-name</c>，
+        /// 附属库依次追加 <c>1</c>、<c>2</c>…后缀。
+        /// </summary>
+        public string Name { get; } = name;
+
+        /// <summary>
+        /// 库序号：0 为主库，正数为附属库。
+        /// </summary>
+        public int Index { get; } = index;
+
+        /// <summary>
+        /// 库内的类分组键（按加入顺序）。
+        /// </summary>
+        public List<string> Owners { get; } = [];
+
+        public int ExportCount { get; set; }
+
+        public bool IsPrimary => Index is 0;
     }
 
     private readonly Dictionary<string, ClassInfo> _classes = [];
@@ -90,6 +134,21 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
     private HashSet<string> _headers = [];
     private string _currentOwner = CommonOwner;
     private int _sourceDefinitionCount;
+
+    /// <summary>
+    /// 拆分出的原生库；<see cref="Generate"/> 期间填充，用于决定每个类写进哪个库。
+    /// </summary>
+    private readonly List<NativeLibrary> _libraries = [];
+
+    /// <summary>
+    /// 类分组键 → 所属库名；决定该类的导出声明与实现进入哪个库的头文件。
+    /// </summary>
+    private readonly Dictionary<string, string> _ownerLibraries = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// 函数（入口点）→ 所属库名；C# 侧据此为每个 <c>LibraryImport</c> 选择目标库。
+    /// </summary>
+    private readonly Dictionary<string, string> _functionLibraries = new(StringComparer.Ordinal);
 
     /// <summary>
     /// 生成的原生文件：相对 native 产物目录的路径与内容。
@@ -146,6 +205,10 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
                     if (_connectionUsed)
                         BindConnectionDestroy();
 
+                    // 导出全部收集完毕后先决定各库边界，再据此写出文件
+                    PlanLibraries();
+                    MapFunctionLibraries();
+
                     // 头文件文本依赖仍存活的游标，必须在翻译单元释放之前生成
                     BuildNativeFiles(headers);
                 }
@@ -183,6 +246,16 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
 
         Console.WriteLine(
             $"生成了 {_sourceDefinitionCount} 个 C 式导出、{_nativeFiles.Count} 个 native 文件（{nativeDirectory}）。");
+        if (_libraries.Count > 1)
+        {
+            Console.WriteLine($"导出数超过单个库上限 {MaxExportsPerLibrary}，已拆成 {_libraries.Count} 个原生库：");
+            foreach (NativeLibrary library in _libraries)
+            {
+                Console.WriteLine(
+                    $"  {library.Name}: {library.ExportCount} 个导出、{library.Owners.Count} 个类"
+                    + (library.IsPrimary ? "（主库）" : ""));
+            }
+        }
 
         // 对生成的 C 头文件再走一遍 C 导出流程；其中是 C++ 翻译单元，clang 参数仍由用户提供
         options.Header = [.. _generatedHeaders];
@@ -192,6 +265,7 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
             UseQtArrays = options.Qt,
             OriginalSignatures = _originalSignatures,
             FreeMemoryFunctionName = FreeMemoryFunctionName,
+            FunctionLibraries = _functionLibraries,
             OpaquePointerTypes = _opaquePointers.Values.ToDictionary(
                 pointer => pointer.CName,
                 pointer => (pointer.ManagedType, pointer.CppName, pointer.DeclarationKey, pointer.Declaration),
@@ -205,6 +279,11 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
     private const string ManifestFileName = "native_manifest.txt";
 
     /// <summary>
+    /// 记录库划分的 CMake 片段文件名；CMake 据此为每个库建立独立目标。
+    /// </summary>
+    private const string LibraryManifestFileName = "generated-libraries.cmake";
+
+    /// <summary>
     /// 写入生成清单，供下次运行精确清理旧产物；不使用通配删除，避免误删目录中用户自己的文件。
     /// </summary>
     private void WriteManifest(string nativeDirectory)
@@ -212,12 +291,54 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
         string[] relativePaths = [.. _nativeFiles
             .Select(file => file.RelativePath)
             .Append(ManifestFileName)
+            .Append(LibraryManifestFileName)
             .OrderBy(path => path, StringComparer.Ordinal)];
         File.WriteAllLines(
             Path.Combine(nativeDirectory, ManifestFileName),
             relativePaths,
             new UTF8Encoding(false));
+
+        WriteLibraryManifest(nativeDirectory);
     }
+
+    /// <summary>
+    /// 写出库划分清单：每个库的目标名、库名（C# 侧 LibraryImport 使用的名字）、
+    /// 源码目录与导出数量。CMake 可据此为每个库建立独立目标。
+    /// </summary>
+    private void WriteLibraryManifest(string nativeDirectory)
+    {
+        List<string> lines = ["# 由 OBSharp.Interop.NativeBindGenerator --cpp-redirect 生成，请勿手工修改。"];
+
+        lines.Add("set(OBSHARP_NATIVE_LIBRARIES");
+        foreach (NativeLibrary library in _libraries)
+            lines.Add($"    {library.Name}");
+        lines.Add(")");
+
+        lines.Add("");
+        lines.Add("# 每个库的导出数量");
+
+        foreach (NativeLibrary library in _libraries)
+        {
+            // 源码目录：主库在 native 根目录，附属库在 <库名>/ 子目录
+            string sourceDirectory = library.IsPrimary ? "." : library.Name;
+            lines.Add($"set(OBSHARP_NATIVE_LIBRARY_{LibraryKey(library.Name)}_EXPORTS \"{library.ExportCount}\")");
+            lines.Add($"set(OBSHARP_NATIVE_LIBRARY_{LibraryKey(library.Name)}_SOURCE_DIR \"${{CMAKE_CURRENT_LIST_DIR}}/{sourceDirectory}\")");
+            lines.Add($"set(OBSHARP_NATIVE_LIBRARY_{LibraryKey(library.Name)}_PRIMARY \"{(library.IsPrimary ? "ON" : "OFF")}\")");
+        }
+
+        File.WriteAllText(
+            Path.Combine(nativeDirectory, LibraryManifestFileName),
+            string.Join("\n", lines) + "\n",
+            new UTF8Encoding(false));
+    }
+
+    /// <summary>
+    /// 把库名转成合法的 CMake 变量名片段（字母、数字、下划线）。
+    /// </summary>
+    private static string LibraryKey(string libraryName)
+        => new(libraryName
+            .Select(c => char.IsLetterOrDigit(c) ? char.ToUpperInvariant(c) : '_')
+            .ToArray());
 
     /// <summary>
     /// 按上次的清单删除本次不再产生的生成文件，避免类改名或删除后残留旧文件继续参与编译。
@@ -1645,6 +1766,7 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
 
         ExportGroup group = GroupOf(_currentOwner);
         group.HeaderDeclarations.Add($"{returnPlan.H} CPPM_CALL {cName}({hParameters});");
+        group.FunctionNames.Add(cName);
         group.SourceDefinitions.Add(Lf($$"""
             CPPM_EXPORT {{returnPlan.C}} CPPM_CALL {{cName}}({{cParameters}})
             {
@@ -1652,6 +1774,60 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
             }
             """));
         _sourceDefinitionCount++;
+    }
+
+    /// <summary>
+    /// 把类分组键分配到各个库：按类名顺序贪心装箱，单个库的导出数不超过
+    /// <see cref="MaxExportsPerLibrary"/>。公共声明固定留在主库。
+    /// </summary>
+    private void PlanLibraries()
+    {
+        _libraries.Clear();
+        _ownerLibraries.Clear();
+        _functionLibraries.Clear();
+
+        NativeLibrary primary = new(options.LibraryName, 0);
+        _libraries.Add(primary);
+
+        // 公共声明（free_memory、Qt 连接销毁）固定放主库
+        _ownerLibraries[CommonOwner] = primary.Name;
+        primary.ExportCount += GroupOf(CommonOwner).Count;
+
+        NativeLibrary current = primary;
+        foreach ((string owner, ExportGroup group) in _groups
+            .Where(entry => entry.Key != CommonOwner && entry.Value.Count > 0)
+            .OrderBy(entry => entry.Key, StringComparer.Ordinal))
+        {
+            // 单个类自身超过上限时无法再拆（类是不可分割的单位），只能单独占一个库
+            bool needsNewLibrary = group.Count <= MaxExportsPerLibrary
+                && current.ExportCount + group.Count > MaxExportsPerLibrary;
+
+            if (needsNewLibrary)
+            {
+                // 附属库按 1、2、3… 命名，与 --library-name 拼成 X1、X2…
+                current = new NativeLibrary(options.LibraryName + _libraries.Count, _libraries.Count);
+                _libraries.Add(current);
+            }
+
+            _ownerLibraries[owner] = current.Name;
+            current.Owners.Add(owner);
+            current.ExportCount += group.Count;
+        }
+    }
+
+    /// <summary>
+    /// 记录函数的库归属，供 C# 侧为每个 <c>LibraryImport</c> 选择目标库。
+    /// </summary>
+    private void MapFunctionLibraries()
+    {
+        foreach ((string owner, ExportGroup group) in _groups)
+        {
+            if (!_ownerLibraries.TryGetValue(owner, out string? library))
+                continue;
+
+            foreach (string name in group.FunctionNames)
+                _functionLibraries[name] = library;
+        }
     }
 
     private ExportGroup GroupOf(string owner)
@@ -1671,44 +1847,65 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
     /// <summary>
     /// 生成按类拆分的 native 产物：
     /// <list type="bullet">
-    /// <item><c>&lt;native-name&gt;.h</c> / <c>&lt;native-name&gt;.cpp</c>：公共声明（桥接类型、枚举、不透明指针、free_memory）与类句柄前置声明；</item>
+    /// <item><c>&lt;native-name&gt;.h</c>：公共声明（桥接类型、枚举、不透明指针、free_memory）与类句柄前置声明；</item>
     /// <item><c>&lt;类名&gt;.h</c> / <c>&lt;类名&gt;.cpp</c>：该类的导出声明与实现，各为一个翻译单元。</item>
     /// </list>
     /// 分开的翻译单元让编译器与 Roslyn 都能并行处理，避免单个巨大文件拖慢甚至引发编译失败。
+    /// 当导出数超过单个 PE 导出表上限时，产物会进一步拆成多个库，
+    /// 附属库的源码放在 <c>&lt;native-name&gt;&lt;n&gt;/</c> 子目录，库名为 <c>--library-name</c> 加 <c>n</c> 后缀。
     /// </summary>
     private void BuildNativeFiles(string[] headers)
     {
         string includes = string.Join("\n", headers.Select(header =>
             $"#include \"{header.Replace('\\', '/')}\""));
 
-        // 公共头：所有拆分文件都包含它，因此这里集中放置共享声明
+        // 公共头只写一份，主库与所有附属库都包含它
         string commonHeader = BuildCommonHeader();
         _nativeFiles.Add(new(options.NativeName + ".h", commonHeader));
         _generatedHeaders.Add(Path.Combine(
             Path.GetFullPath(options.NativeOutput), options.NativeName + ".h"));
 
-        // 公共实现：free_memory 与 Qt 连接销毁
-        _nativeFiles.Add(new(
-            options.NativeName + ".cpp",
-            BuildCommonSource(includes)));
-
-        // 同一个头文件里可能出现清理后同名的类（如 a::b 与 a_b），文件名需去重
+        // 同一个头文件里可能出现清理后同名的类（如 a::b 与 a_b），文件名需去重。
+        // 跨库也要去重：附属库虽然在不同目录，但类名重复容易混淆。
         HashSet<string> usedBaseNames = [with(StringComparer.OrdinalIgnoreCase)];
         usedBaseNames.Add(options.NativeName);
 
-        foreach ((string owner, ExportGroup group) in _groups
-            .Where(entry => entry.Key != CommonOwner && entry.Value.Count > 0)
-            .OrderBy(entry => entry.Key, StringComparer.Ordinal))
+        foreach (NativeLibrary library in _libraries)
         {
-            string baseName = FileBaseName(owner);
-            string unique = baseName;
-            for (int suffix = 2; !usedBaseNames.Add(unique); suffix++)
-                unique = $"{baseName}_{suffix}";
+            // 主库文件放在 native 根目录，附属库放进 <native-name><n>/ 子目录
+            string directory = library.IsPrimary ? "" : library.Name + "/";
 
-            string headerName = unique + ".h";
-            _nativeFiles.Add(new(headerName, BuildGroupHeader(owner, group)));
-            _nativeFiles.Add(new(unique + ".cpp", BuildGroupSource(owner, group, includes)));
-            _generatedHeaders.Add(Path.Combine(Path.GetFullPath(options.NativeOutput), headerName));
+            // 每个库一个公共实现文件：free_memory 只属于主库，Qt 连接销毁跟着主库走
+            if (library.IsPrimary)
+            {
+                _nativeFiles.Add(new(
+                    library.Name + ".cpp",
+                    BuildCommonSource(includes, CommonOwner)));
+            }
+
+            foreach (string owner in library.Owners)
+            {
+                ExportGroup group = GroupOf(owner);
+                string baseName = FileBaseName(owner);
+                string unique = baseName;
+                for (int suffix = 2; !usedBaseNames.Add(unique); suffix++)
+                    unique = $"{baseName}_{suffix}";
+
+                // 附属库文件位于子目录，包含公共头/工具头需要向上一级
+                string commonInclude = library.IsPrimary
+                    ? options.NativeName + ".h"
+                    : "../" + options.NativeName + ".h";
+                string marshallerInclude = library.IsPrimary
+                    ? CppMarshaller.FileName
+                    : "../" + CppMarshaller.FileName;
+                string headerName = unique + ".h";
+                _nativeFiles.Add(new(directory + headerName, BuildGroupHeader(owner, group, commonInclude)));
+                _nativeFiles.Add(new(
+                    directory + unique + ".cpp",
+                    BuildGroupSource(owner, group, includes, marshallerInclude)));
+                _generatedHeaders.Add(Path.Combine(
+                    Path.GetFullPath(options.NativeOutput), directory + headerName));
+            }
         }
 
         _nativeFiles.Add(new(CppMarshaller.FileName, CppMarshaller.Source.Replace("\r\n", "\n") + "\n"));
@@ -1790,14 +1987,14 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
     }
 
     /// <summary>
-    /// 公共实现：free_memory 与 Qt 连接销毁。
+    /// 主库的公共实现：free_memory 与 Qt 连接销毁。
     /// 与拆分类文件保持一致，不包含公共头（头文件里的强类型句柄与实现的 <c>void*</c> 签名不同）。
     /// </summary>
-    private string BuildCommonSource(string includes)
+    private string BuildCommonSource(string includes, string owner)
     {
-        string typedefs = string.Join("\n", GroupOf(CommonOwner).SourceTypedefs);
-        string definitions = string.Join("\n\n",
-            GroupOf(CommonOwner).SourceDefinitions);
+        ExportGroup group = GroupOf(owner);
+        string typedefs = string.Join("\n", group.SourceTypedefs);
+        string definitions = string.Join("\n\n", group.SourceDefinitions);
 
         return Lf($$"""
             // 由 OBSharp.Interop.NativeBindGenerator --cpp-redirect 生成，请勿手工修改。
@@ -1819,7 +2016,7 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
     /// <summary>
     /// 单个类的头文件：包含公共头，再声明该类的全部 C 式导出。
     /// </summary>
-    private string BuildGroupHeader(string owner, ExportGroup group)
+    private static string BuildGroupHeader(string owner, ExportGroup group, string commonInclude)
     {
         string typedefs = string.Join("\n", group.HeaderTypedefs);
         string declarations = string.Join("\n", group.HeaderDeclarations);
@@ -1829,7 +2026,7 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
             // 类：{{owner}}
             #pragma once
 
-            #include "{{options.NativeName}}.h"
+            #include "{{commonInclude}}"
 
             #ifdef __cplusplus
             extern "C" {
@@ -1852,7 +2049,7 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
     /// 而实现统一用 <c>void*</c> 承接，同名 extern "C" 函数签名不同会直接报错。
     /// 头文件只供使用方（以及 C# 绑定生成）读取。
     /// </summary>
-    private static string BuildGroupSource(string owner, ExportGroup group, string includes)
+    private static string BuildGroupSource(string owner, ExportGroup group, string includes, string marshallerInclude)
     {
         string typedefs = string.Join("\n", group.SourceTypedefs);
         string definitions = string.Join("\n\n", group.SourceDefinitions);
@@ -1860,7 +2057,7 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
         return Lf($$"""
             // 由 OBSharp.Interop.NativeBindGenerator --cpp-redirect 生成，请勿手工修改。
             // 类：{{owner}}
-            #include "{{CppMarshaller.FileName}}"
+            #include "{{marshallerInclude}}"
             {{includes}}
 
             {{typedefs}}
