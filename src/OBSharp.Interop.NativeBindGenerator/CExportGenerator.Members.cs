@@ -245,35 +245,7 @@ internal sealed partial class CExportGenerator
 
         List<string> blocks = [];
         foreach ((string name, PropertyModel property) in properties.OrderBy(p => p.Key, StringComparer.Ordinal))
-        {
-            List<string> accessors = [];
-            if (property.Getter is not null)
-            {
-                accessors.Add($$"""
-                            get
-                            {
-                    {{Body(property.Getter, typeName, isHandle, 12, "return ")}}
-                            }
-                    """);
-            }
-
-            if (property.Setter is not null)
-            {
-                accessors.Add($$"""
-                            set
-                            {
-                    {{Body(property.Setter, typeName, isHandle, 12, "", "value")}}
-                            }
-                    """);
-            }
-
-            blocks.Add($$"""
-                    public {{property.Type}} {{name}}
-                    {
-                {{string.Join("\n", accessors)}}
-                    }
-                """);
-        }
+            blocks.Add(PropertyBlock(name, property, typeName, isHandle));
 
         HashSet<string> methodSignatures = [];
         string UniqueMethodName(string methodName, string parameterTypes)
@@ -306,31 +278,23 @@ internal sealed partial class CExportGenerator
 
             string parameters = string.Join(", ", function.Parameters.Skip(1)
                 .Select(p => $"{p.Type.Modifier}{p.Type.Type} {p.Name}"));
-            blocks.Add($$"""
-                    public {{function.Return.Type}} {{name}}({{parameters}})
-                    {
-                {{Body(function, typeName, isHandle, 8, function.Return.Type is "void" ? "" : "return ")}}
-                    }
-                """);
+            blocks.Add(MethodBlock($"public {function.Return.Type} {name}({parameters})", function, typeName, isHandle));
         }
 
         foreach ((FunctionModel function, string raw) in staticMembers.OrderBy(m => m.Remainder, StringComparer.Ordinal))
         {
             string parameters = string.Join(", ", function.Parameters
                 .Select(p => $"{p.Type.Modifier}{p.Type.Type} {p.Name}"));
-            string arguments = string.Join(", ", function.Parameters.Select(p => p.Type.Modifier + p.Name));
-            string call = $"{CallTarget(function.Name, typeName)}({arguments})";
 
             string methodName = MemberName(raw);
             string parameterTypes = string.Join(",", function.Parameters
                 .Select(p => p.Type.Modifier + p.Type.Type));
             methodName = UniqueMethodName(methodName, parameterTypes);
-            blocks.Add($$"""
-                    public static {{function.Return.Type}} {{methodName}}({{parameters}})
-                    {
-                        {{(function.Return.Type is "void" ? "" : "return ")}}{{call}};
-                    }
-                """);
+            string arguments = string.Join(", ", function.Parameters.Select(p => p.Type.Modifier + p.Name));
+            string call = $"{CallTarget(function.Name, typeName)}({arguments})";
+            blocks.Add(ExpressionMethod(
+                $"public static {function.Return.Type} {methodName}({parameters})",
+                call));
         }
 
         string body = string.Join("\n\n", blocks);
@@ -342,15 +306,16 @@ internal sealed partial class CExportGenerator
             """;
     }
 
-    private string Body(
-        FunctionModel function,
-        string typeName,
-        bool isHandle,
-        int indent,
-        string prefix,
-        string? valueArgument = null)
+    /// <summary>
+    /// 成员块统一使用 4 个空格缩进，由 <see cref="Body"/> 等辅助方法保留行内缩进。
+    /// </summary>
+    private const string MemberIndent = "    ";
+
+    /// <summary>
+    /// 成员转发调用的表达式；句柄类传 <c>this</c>，结构体传 <c>self</c>。
+    /// </summary>
+    private string Invocation(FunctionModel function, string typeName, bool isHandle, string? valueArgument = null)
     {
-        string pad = new(' ', indent);
         List<string> arguments = [isHandle ? "this" : "self"];
         for (int i = 1; i < function.Parameters.Count; i++)
         {
@@ -360,12 +325,89 @@ internal sealed partial class CExportGenerator
                 : parameter.Type.Modifier + parameter.Name);
         }
 
-        string call = $"{prefix}{CallTarget(function.Name, typeName)}({string.Join(", ", arguments)});";
-        return isHandle
-            ? pad + call
-            : $$"""
-                {{pad}}fixed ({{typeName}}* self = &this)
-                {{pad}}    {{call}}
-                """;
+        return $"{CallTarget(function.Name, typeName)}({string.Join(", ", arguments)})";
     }
+
+    /// <summary>
+    /// 结构体成员的调用体：转发调用前必须先通过 <c>fixed</c> 取得自身指针，而 <c>fixed</c> 是语句，
+    /// 因此这类成员无法写成表达式主体。
+    /// </summary>
+    private string Body(
+        FunctionModel function,
+        string typeName,
+        int indent,
+        string prefix,
+        string? valueArgument = null)
+    {
+        string pad = new(' ', indent);
+        return $$"""
+            {{pad}}fixed ({{typeName}}* self = &this)
+            {{pad}}    {{prefix}}{{Invocation(function, typeName, false, valueArgument)}};
+            """;
+    }
+
+    /// <summary>
+    /// 属性块；句柄类的访问器只有一次转发调用，用表达式主体表达，只有 getter 时进一步简化为表达式主体属性。
+    /// 结构体则因需要 <c>fixed</c> 取得自身指针，只能保留块主体。
+    /// </summary>
+    private string PropertyBlock(string name, PropertyModel property, string typeName, bool isHandle)
+    {
+        if (isHandle
+            && property is { Getter: { } getter, Setter: null })
+        {
+            return $"{MemberIndent}public {property.Type} {name} => {Invocation(getter, typeName, true)};";
+        }
+
+        List<string> accessors = [];
+        if (property.Getter is not null)
+            accessors.Add(AccessorBlock("get", property.Getter, typeName, isHandle, null));
+
+        if (property.Setter is not null)
+            accessors.Add(AccessorBlock("set", property.Setter, typeName, isHandle, "value"));
+
+        return string.Join("\n",
+            $"{MemberIndent}public {property.Type} {name}",
+            $"{MemberIndent}{{",
+            string.Join("\n", accessors),
+            $"{MemberIndent}}}");
+    }
+
+    private string AccessorBlock(
+        string keyword,
+        FunctionModel function,
+        string typeName,
+        bool isHandle,
+        string? valueArgument)
+    {
+        if (isHandle)
+            return $"{MemberIndent}{MemberIndent}{keyword} => {Invocation(function, typeName, true, valueArgument)};";
+
+        return string.Join("\n",
+            $"{MemberIndent}{MemberIndent}{keyword}",
+            $"{MemberIndent}{MemberIndent}{{",
+            Body(function, typeName, 12, keyword is "get" ? "return " : "", valueArgument),
+            $"{MemberIndent}{MemberIndent}}}");
+    }
+
+    /// <summary>
+    /// 方法块；句柄类的实例方法与全部静态成员都只有一次转发调用，用表达式主体表达；
+    /// 结构体实例方法需要先 <c>fixed</c> 取得自身指针，只能保留块主体。
+    /// </summary>
+    private string MethodBlock(string signature, FunctionModel function, string typeName, bool isHandle)
+    {
+        if (isHandle)
+            return ExpressionMethod(signature, Invocation(function, typeName, true));
+
+        return string.Join("\n",
+            MemberIndent + signature,
+            $"{MemberIndent}{{",
+            Body(function, typeName, 8, function.Return.Type is "void" ? "" : "return "),
+            $"{MemberIndent}}}");
+    }
+
+    /// <summary>
+    /// 单行表达式主体成员；转发调用本身没有副作用之外的逻辑，不需要语句块。
+    /// </summary>
+    private static string ExpressionMethod(string signature, string expression)
+        => $"{MemberIndent}{signature} => {expression};";
 }

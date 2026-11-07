@@ -77,6 +77,8 @@ NativeBindGenerator \
 生成器会在 `generated/csharp` 下按声明拆分为多个 `*.g.cs` 文件（均是统一命名空间下的 partial 声明）：
 
 - 能按名称前缀与首参类型归类到某个类型的函数，其 `LibraryImport` 声明、全局包装和成员方法都写入该类型的 `*.g.cs` 文件，并放在同一个 partial 类型里；例如 `widget_get_value` 会进入 `Widget` 类型，调用处无需再经过 `NativeMethods`。
+- `get_`/`set_` 成对的函数合并为属性；句柄类型的成员只有一次转发调用，因此生成表达式主体（`get => ...;`、`set => ...;`），只有 getter 时进一步简化为 `public int Value => Native_get_value(this);`。方法同样使用 `=>`，例如 `public int Compute(int a, int b) => Native_compute(this, a, b);`。
+- 需要先通过 `fixed` 取得自身指针的结构体实例成员无法写成表达式主体，这类成员保留 `{ ... }` 块主体。
 - 返回某个句柄类型的工厂函数（如 `Widget * Widget_create(int)`、`OpaqueContext * opaque_create(void)`）也会进入该类型，并生成静态方法而不是构造函数，例如 `Widget.Create(42)`、`OpaqueContext.OpaqueCreate()`。
 - 只有当函数无法归类（没有对应的类型前缀、首参不属于任何已生成类型，且返回类型也不是句柄类型）时，才作为全局函数写入 `NativeMethods.g.cs`；数量较多时继续拆成 `NativeMethods.2.g.cs`、`NativeMethods.3.g.cs` 等 partial 分片。
 - 每个结构体、联合体、枚举、SafeHandle 以及定长数组的 `InlineArray` 类型各写入一个以类型名命名的 `*.g.cs` 文件；类型定义、成员扩展与导入声明写在同一个文件中。

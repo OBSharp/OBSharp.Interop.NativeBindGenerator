@@ -475,28 +475,36 @@ internal sealed unsafe partial class CExportGenerator(ICExportGeneratorOptions o
         }
 
         string call = $"{nativeMethodName}({string.Join(", ", arguments)})";
+        string signature = $"public static {returnType.Type} {Identifier(name)}({string.Join(", ", declarations)})";
+        if (returnCountIndex is null
+            && fixedStatements.Count is 0)
+        {
+            return $"    {signature} => {call};";
+        }
+
+        // 其余情形都包含语句（fixed、返回数组的复制与释放），只能使用块主体
         string body;
         if (returnCountIndex is not null)
         {
             string elementType = returnElementType!;
             body = $$"""
-                    {{nativeReturnType.Type}} _cppmResult = {{call}};
-                    try
-                    {
-                        if (_cppmCount is 0)
-                            return ReadOnlySpan<{{elementType}}>.Empty;
-                        if (_cppmResult is null)
-                            throw new InvalidOperationException("原生 QList 返回了空指针和非零长度");
+                {{nativeReturnType.Type}} _cppmResult = {{call}};
+                try
+                {
+                    if (_cppmCount is 0)
+                        return ReadOnlySpan<{{elementType}}>.Empty;
+                    if (_cppmResult is null)
+                        throw new InvalidOperationException("原生 QList 返回了空指针和非零长度");
 
-                        {{elementType}}[] copy = new ReadOnlySpan<{{elementType}}>(
-                            _cppmResult,
-                            checked((int)_cppmCount)).ToArray();
-                        return copy;
-                    }
-                    finally
-                    {
-                        NativeMethods.{{freeMemoryFunctionName}}((nint)_cppmResult);
-                    }
+                    {{elementType}}[] copy = new ReadOnlySpan<{{elementType}}>(
+                        _cppmResult,
+                        checked((int)_cppmCount)).ToArray();
+                    return copy;
+                }
+                finally
+                {
+                    NativeMethods.{{freeMemoryFunctionName}}((nint)_cppmResult);
+                }
                 """;
             body = "nuint _cppmCount;\n" + body;
         }
@@ -511,9 +519,9 @@ internal sealed unsafe partial class CExportGenerator(ICExportGeneratorOptions o
             body = $"{fixedStatements[i]}\n{{\n{Indent(body, 4)}\n}}";
 
         return $$"""
-                public static {{returnType.Type}} {{Identifier(name)}}({{string.Join(", ", declarations)}})
+                {{signature}}
                 {
-            {{Indent(body, 4)}}
+            {{Indent(body, 8)}}
                 }
             """;
     }
