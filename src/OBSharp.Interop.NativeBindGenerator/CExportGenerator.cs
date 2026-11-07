@@ -275,8 +275,12 @@ internal sealed unsafe partial class CExportGenerator(ICExportGeneratorOptions o
     private string FunctionSource(CXCursor function, string name)
     {
         CXType functionType = clang.getCursorType(function);
-        if (clang.isFunctionTypeVariadic(functionType) is not 0)
-            throw new NotSupportedException("变参函数无法直接 P/Invoke，请在原生侧提供定参包装");
+        if (clang.isFunctionTypeVariadic(functionType) is not 0
+            && !options.AllowVariadic)
+        {
+            throw new NotSupportedException(
+                "变参函数无法直接 P/Invoke，请在原生侧提供定参包装，或使用 --allow-variadic 只绑定定参部分");
+        }
 
         _currentFunction = name;
         CXType nativeReturn = clang.getCursorResultType(function);
@@ -541,12 +545,15 @@ internal sealed unsafe partial class CExportGenerator(ICExportGeneratorOptions o
 
         string returnType = clang.getTypeSpelling(clang.getCursorResultType(function)).ToString();
         int count = clang.Cursor_getNumArguments(function);
-        string parameters = count is 0
-            ? "void"
-            : string.Join(", ", Enumerable.Range(0, count)
-                .Select(index => clang.getTypeSpelling(clang.getCursorType(
-                    clang.Cursor_getArgument(function, (uint)index))).ToString()));
-        return $"{returnType} {name}({parameters})";
+        // 变参函数的原生声明保留 ...，即使 C# 绑定只覆盖定参部分
+        bool variadic = clang.isFunctionTypeVariadic(clang.getCursorType(function)) is not 0;
+        List<string> parameters = [.. Enumerable.Range(0, count)
+            .Select(index => clang.getTypeSpelling(clang.getCursorType(
+                clang.Cursor_getArgument(function, (uint)index))).ToString())];
+        if (variadic)
+            parameters.Add("...");
+        string parameterList = parameters.Count is 0 ? "void" : string.Join(", ", parameters);
+        return $"{returnType} {name}({parameterList})";
     }
 
     private static string XmlEscape(string value)

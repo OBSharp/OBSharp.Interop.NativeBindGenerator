@@ -201,6 +201,7 @@ NativeBindGenerator \
 | `--string-marshaller` | 默认 UTF-8 封送 | 为 `const char*` 参数指定自定义 marshaller 类型名。 |
 | `--return-string-marshaller` | 默认 UTF-8 封送 | 为 `const char*` 返回值指定自定义 marshaller 类型名。 |
 | `--nullable-handle-marshaller` | 默认关闭 | 为句柄参数指定可空 marshaller 类型名；指定后句柄参数生成 `Xxx?`，托管 `null` 映射为原生 NULL。 |
+| `--allow-variadic` | 关闭 | 为变参函数和变参函数指针只生成定参部分的绑定；默认跳过。详见[变参函数](#变参函数)。 |
 | `--cpp-redirect` | 关闭 | 生成 C++ 类的 C 式 native 转发代码，并据此生成 C# 绑定。 |
 | `--qt` | 关闭 | 启用 Qt 特殊处理；需配合 `--cpp-redirect`。 |
 | `--native-output` | `generated/native` | `--cpp-redirect` 的 native 文件输出目录。 |
@@ -212,6 +213,17 @@ NativeBindGenerator \
 自定义 marshaller 参数只需填写类型名，例如 `MyStringMarshaller`；生成代码会使用 `MarshalUsing(typeof(MyStringMarshaller))`。自定义类型必须能被生成后的 C# 代码访问，并符合 .NET interop marshalling 的要求。
 
 `--nullable-handle-marshaller` 遵循同样的填写方式。指定后，句柄参数在包装 API 中变成 `Xxx?`，导入声明则使用 `[MarshalUsing(typeof(该类型))] SafeHandle?`，这样同一个 marshaller 可以覆盖所有生成的句柄类型；marshaller 需按 `[CustomMarshaller(typeof(SafeHandle), MarshalMode.ManagedToUnmanagedIn, typeof(...))]` 声明。
+
+### 变参函数
+
+生成器默认跳过声明中含 `...` 的变参函数与变参函数指针，并在 stderr 打印跳过提示。指定 `--allow-variadic` 后，只为它们的定参部分生成绑定：
+
+- C# 方法只包含 `...` 之前的参数，不生成 `params` 数组，调用时无法再传入变参实参；例如 `void blog(int log_level, const char *format, ...);` 生成 `blog(int log_level, [MarshalAs(UnmanagedType.LPUTF8Str)] string? format)`。
+- XML 文档注释中的原生声明保留 `...`，例如 `<c>void blog(int, const char *, ...)</c>`。
+- 变参函数指针（如结构体字段 `int (*handler)(const char*, ...)`）同样由该开关控制：默认跳过该类型，开启后按定参部分映射为 `delegate* unmanaged[...]`。
+- `--cpp-redirect` 原本就会为变参 C++ 方法生成定参 C 包装，生成哪些绑定与该开关无关；这些绑定 XML 文档里的原生声明始终保留 `...`，因为那才是方法的真实声明。
+
+> 注意：该开关只让定参部分可用，并不能解决变参调用本身的 ABI 问题。在 x86-64 SysV（Linux/macOS）上，调用变参函数时调用方需通过 `AL` 寄存器告知使用的向量寄存器个数；`LibraryImport` 生成的调用不会设置该寄存器，若原生函数经由 `va_arg` 读取浮点变参，行为是未定义的。只有当原生函数不读取浮点变参，或平台/调用约定不依赖 `AL`（例如 Windows x64）时，这样生成的绑定才可信赖。
 
 ## 类型映射概览
 

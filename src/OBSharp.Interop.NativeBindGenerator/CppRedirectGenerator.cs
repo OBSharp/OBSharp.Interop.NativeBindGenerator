@@ -1823,14 +1823,15 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
     {
         string returnType = clang.getTypeSpelling(clang.getCursorResultType(method)).ToString();
         int count = clang.Cursor_getNumArguments(method);
-        string parameters = count is 0
-            ? ""
-            : string.Join(", ", Enumerable.Range(0, count)
-                .Select(index => clang.getTypeSpelling(clang.getCursorType(
-                    clang.Cursor_getArgument(method, (uint)index))).ToString()));
+        List<string> parameters = [.. Enumerable.Range(0, count)
+            .Select(index => clang.getTypeSpelling(clang.getCursorType(
+                clang.Cursor_getArgument(method, (uint)index))).ToString())];
+        // 变参方法的原始声明保留 ...，生成的 C 包装本身只转发定参部分
+        if (clang.isFunctionTypeVariadic(clang.getCursorType(method)) is not 0)
+            parameters.Add("...");
         string isConst = clang.CXXMethod_isConst(method) is not 0 ? " const" : "";
         string declaringName = QualifiedName(clang.getCursorSemanticParent(method)).Cpp ?? info.CppName;
-        return $"{returnType} {declaringName}::{name}({parameters}){isConst}";
+        return $"{returnType} {declaringName}::{name}({string.Join(", ", parameters)}){isConst}";
     }
 
     private void BindFieldGetter(ClassInfo info, string field, CXType type, string snake)

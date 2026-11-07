@@ -307,8 +307,11 @@ internal sealed unsafe partial class CExportGenerator
 
     private string FunctionPointerType(CXType function)
     {
-        if (clang.isFunctionTypeVariadic(function) is not 0)
-            throw new NotSupportedException("变参函数指针无法映射");
+        if (clang.isFunctionTypeVariadic(function) is not 0
+            && !options.AllowVariadic)
+        {
+            throw new NotSupportedException("变参函数指针无法映射，请使用 --allow-variadic 只映射定参部分");
+        }
 
         string convention = clang.getFunctionTypeCallingConv(function) switch
         {
