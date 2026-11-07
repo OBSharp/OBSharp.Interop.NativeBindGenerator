@@ -132,6 +132,9 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
     private readonly Dictionary<string, ExportGroup> _groups = new(StringComparer.Ordinal);
     private readonly Dictionary<string, string> _originalSignatures = new(StringComparer.Ordinal);
     private HashSet<string> _headers = [];
+    private readonly Dictionary<string, string> _headerPaths = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, HashSet<string>> _groupHeaders = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, string> _ownerDefinitionHeaders = new(StringComparer.Ordinal);
     private string _currentOwner = CommonOwner;
     private int _sourceDefinitionCount;
 
@@ -167,6 +170,11 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
         LibClangLoader.Ensure();
         string[] headers = [.. options.Header.Select(Path.GetFullPath)];
         _headers = [.. headers.Select(NormalizePath)];
+        _headerPaths.Clear();
+        foreach (string header in headers)
+            _headerPaths.TryAdd(NormalizePath(header), header);
+        _groupHeaders.Clear();
+        _ownerDefinitionHeaders.Clear();
 
         string staging = Path.Combine(Path.GetTempPath(), "nbg-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(staging);
@@ -380,6 +388,96 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
             && _headers.Contains(NormalizePath(Path.GetFullPath(name)));
     }
 
+    // ---- 按类收集依赖头文件（--minimal-includes） ----
+
+    /// <summary>
+    /// 记录游标所在文件；只保留 <c>--header</c> 中列出的原始头文件，
+    /// 系统头文件与生成头文件由这些原始头文件间接带入。
+    /// </summary>
+    private void RecordHeader(CXCursor cursor)
+    {
+        if (!options.MinimalIncludes)
+            return;
+
+        clang.getCursorLocation(cursor).GetExpansionLocation(out CXFile file, out _, out _, out _);
+        RecordHeaderPath(clang.getFileName(file).ToString());
+    }
+
+    /// <summary>
+    /// 记录类定义所在的头文件。生成翻译单元时把它排在依赖头文件之前，
+    /// 因为部分 Qt 头（如 <c>qopenglext.h</c>）依赖先前已包含的 GL 类型定义。
+    /// </summary>
+    private void RecordDefinitionHeader(string owner, CXCursor cursor)
+    {
+        if (!options.MinimalIncludes)
+            return;
+
+        clang.getCursorLocation(cursor).GetExpansionLocation(out CXFile file, out _, out _, out _);
+        string path = clang.getFileName(file).ToString();
+        if (path.Length is 0)
+            return;
+
+        string normalized = NormalizePath(Path.GetFullPath(path));
+        if (_headerPaths.TryGetValue(normalized, out string? header))
+            _ownerDefinitionHeaders[owner] = header;
+    }
+
+    private void RecordHeaderPath(string path)
+    {
+        if (!options.MinimalIncludes || path.Length is 0)
+            return;
+
+        string normalized = NormalizePath(Path.GetFullPath(path));
+        if (!_headerPaths.TryGetValue(normalized, out string? header))
+            return;
+
+        if (!_groupHeaders.TryGetValue(_currentOwner, out HashSet<string>? headers))
+            _groupHeaders[_currentOwner] = headers = new(StringComparer.Ordinal);
+        headers.Add(header);
+    }
+
+    /// <summary>
+    /// 记录类型声明（以及数组元素、引用目标、模板实参）所在的头文件。
+    /// 递归深度有限，避免复杂的模板实例化把整棵类型树都拉进来。
+    /// </summary>
+    private void RecordTypeHeader(CXType type, int depth = 0)
+    {
+        if (!options.MinimalIncludes || depth > 8)
+            return;
+
+        CXCursor declaration = clang.getTypeDeclaration(type);
+        if (clang.Cursor_isNull(declaration) is 0)
+            RecordHeader(declaration);
+
+        CXType canonical = clang.getCanonicalType(type);
+        switch (canonical.kind)
+        {
+            case CXTypeKind.CXType_Pointer:
+            case CXTypeKind.CXType_LValueReference:
+            case CXTypeKind.CXType_RValueReference:
+                RecordTypeHeader(clang.getPointeeType(canonical), depth + 1);
+                break;
+
+            case CXTypeKind.CXType_ConstantArray:
+            case CXTypeKind.CXType_IncompleteArray:
+            case CXTypeKind.CXType_VariableArray:
+                RecordTypeHeader(clang.getArrayElementType(canonical), depth + 1);
+                break;
+
+            case CXTypeKind.CXType_FunctionProto:
+            case CXTypeKind.CXType_FunctionNoProto:
+                RecordTypeHeader(clang.getResultType(canonical), depth + 1);
+                int argumentCount = clang.getNumArgTypes(canonical);
+                for (uint index = 0; index < argumentCount; index++)
+                    RecordTypeHeader(clang.getArgType(canonical, index), depth + 1);
+                break;
+        }
+
+        int templateArgumentCount = clang.Type_getNumTemplateArguments(canonical);
+        for (uint index = 0; index < templateArgumentCount; index++)
+            RecordTypeHeader(clang.Type_getTemplateArgumentAsType(canonical, index), depth + 1);
+    }
+
     private static bool IsPublic(CXCursor cursor)
     {
         CX_CXXAccessSpecifier access = clang.getCXXAccessSpecifier(cursor);
@@ -513,10 +611,16 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
             || clang.Cursor_isFunctionInlined(member) is not 0;
     }
 
+    // MSVC 用 __declspec(dllimport/dllexport) 标记导出，ELF/Mach-O 上 Q_DECL_EXPORT
+    // 展开为 __attribute__((visibility("default")))。libclang 会把它挂成子游标
+    // VisibilityAttr，spelling 为 "default"；不能改用 getCursorVisibility，
+    // 因为没有任何属性的结构体也会返回 Default，无法区分显式导出。
     private static bool HasDllImportOrExport(CXCursor cursor)
         => CExportGenerator.ChildrenOf(cursor).Any(child =>
             clang.getCursorKind(child) is CXCursorKind.CXCursor_DLLImport
-                or CXCursorKind.CXCursor_DLLExport);
+                or CXCursorKind.CXCursor_DLLExport
+            || (clang.getCursorKind(child) is CXCursorKind.CXCursor_VisibilityAttr
+                && Spelling(child) is "default"));
 
     private static bool HasTemplateArguments(CXCursor cursor)
     {
@@ -1260,6 +1364,8 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
     {
         // 该类的全部导出写入以类名命名的 .h/.cpp 对
         _currentOwner = info.CName;
+        RecordHeader(info.Cursor);
+        RecordDefinitionHeader(info.CName, info.Cursor);
         try
         {
             BindClassCore(info);
@@ -1320,6 +1426,8 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
             string fieldName = Spelling(child);
             string snake = fieldName.Underscore();
             CXType fieldType = clang.getCursorType(child);
+            RecordHeader(child);
+            RecordTypeHeader(fieldType);
             TryBind(info, "get_" + snake, () => BindFieldGetter(info, fieldName, fieldType, snake));
             if (clang.isConstQualifiedType(fieldType) is 0)
                 TryBind(info, "set_" + snake, () => BindFieldSetter(info, fieldName, fieldType, snake));
@@ -1378,6 +1486,7 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
 
                 case CXCursorKind.CXCursor_CXXBaseSpecifier when IsPublic(child):
                     CXCursor baseDeclaration = clang.getTypeDeclaration(clang.getCursorType(child));
+                    RecordHeader(baseDeclaration);
                     if (_classes.ContainsKey(Usr(baseDeclaration)))
                     {
                         foreach (var inherited in PublicMethods(baseDeclaration))
@@ -1575,6 +1684,7 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
 
     private void BindSignal(ClassInfo info, CXCursor signal, string name)
     {
+        RecordHeader(signal);
         string snake = name.Underscore();
         string callbackName = UniqueName($"{info.CName}_{snake}_callback");
         List<string> hTypes = ["void*"];
@@ -1587,6 +1697,7 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
         for (int i = 0; i < count; i++)
         {
             CXType type = clang.getCursorType(clang.Cursor_getArgument(signal, (uint)i));
+            RecordTypeHeader(type);
             var (h, c, expression) = ConvertCallbackArgument(type, $"p{i}");
             string cppType = CallbackCppType(type);
             hTypes.Add(h);
@@ -1650,6 +1761,8 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
         {
             CXCursor argument = clang.Cursor_getArgument(function, (uint)i);
             string name = ParameterName(argument, i, used);
+            RecordHeader(argument);
+            RecordTypeHeader(clang.getCursorType(argument));
             ParamPlan plan = ConvertParameter(clang.getCursorType(argument), name);
             foreach (Param parameter in plan.Params.Where(parameter => parameter.Name != name))
             {
@@ -1666,6 +1779,8 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
 
     private void BindConstructor(ClassInfo info, CXCursor constructor)
     {
+        RecordHeader(constructor);
+        RecordTypeHeader(clang.getCursorResultType(constructor));
         List<Param> parameters = [];
         List<string> arguments = [];
         ConvertArguments(constructor, parameters, arguments);
@@ -1678,6 +1793,8 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
 
     private void BindMethod(ClassInfo info, CXCursor method, string name)
     {
+        RecordHeader(method);
+        RecordTypeHeader(clang.getCursorResultType(method));
         ReturnPlan returnPlan = ConvertReturn(clang.getCursorResultType(method));
         bool isStatic = clang.CXXMethod_isStatic(method) is not 0;
         bool isConst = clang.CXXMethod_isConst(method) is not 0;
@@ -1848,67 +1965,157 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
     /// 生成按类拆分的 native 产物：
     /// <list type="bullet">
     /// <item><c>&lt;native-name&gt;.h</c>：公共声明（桥接类型、枚举、不透明指针、free_memory）与类句柄前置声明；</item>
+    /// <item><c>&lt;native-name&gt;.pch.h</c>：只包含全部原始头文件的预编译头，include 顺序与类翻译单元一致；</item>
     /// <item><c>&lt;类名&gt;.h</c> / <c>&lt;类名&gt;.cpp</c>：该类的导出声明与实现，各为一个翻译单元。</item>
     /// </list>
     /// 分开的翻译单元让编译器与 Roslyn 都能并行处理，避免单个巨大文件拖慢甚至引发编译失败。
     /// 当导出数超过单个 PE 导出表上限时，产物会进一步拆成多个库，
     /// 附属库的源码放在 <c>&lt;native-name&gt;&lt;n&gt;/</c> 子目录，库名为 <c>--library-name</c> 加 <c>n</c> 后缀。
+    /// <c>--batch-size</c> 可把同一库内的多个类合并进一个翻译单元。
     /// </summary>
     private void BuildNativeFiles(string[] headers)
     {
-        string includes = string.Join("\n", headers.Select(header =>
-            $"#include \"{header.Replace('\\', '/')}\""));
+        string nativeDirectory = Path.GetFullPath(options.NativeOutput);
+        string rootIncludes = BuildIncludeLines(headers, nativeDirectory);
+
+        // 预编译头只放原始头文件，顺序与每个类 .cpp 的 preamble 一致；不放 cpp_marshaller.hpp。
+        _nativeFiles.Add(new(
+            options.NativeName + ".pch.h",
+            Lf($"#pragma once\n\n{rootIncludes}\n")));
 
         // 公共头只写一份，主库与所有附属库都包含它
         string commonHeader = BuildCommonHeader();
         _nativeFiles.Add(new(options.NativeName + ".h", commonHeader));
         _generatedHeaders.Add(Path.Combine(
-            Path.GetFullPath(options.NativeOutput), options.NativeName + ".h"));
+            nativeDirectory, options.NativeName + ".h"));
 
         // 同一个头文件里可能出现清理后同名的类（如 a::b 与 a_b），文件名需去重。
         // 跨库也要去重：附属库虽然在不同目录，但类名重复容易混淆。
         HashSet<string> usedBaseNames = [with(StringComparer.OrdinalIgnoreCase)];
         usedBaseNames.Add(options.NativeName);
 
+        int batchSize = Math.Max(1, options.BatchSize);
         foreach (NativeLibrary library in _libraries)
         {
             // 主库文件放在 native 根目录，附属库放进 <native-name><n>/ 子目录
             string directory = library.IsPrimary ? "" : library.Name + "/";
+            string libraryDirectory = library.IsPrimary
+                ? nativeDirectory
+                : Path.Combine(nativeDirectory, library.Name);
+
+            // 附属库的源码在子目录中，相对 include 需要相对该目录计算
+            string fallbackIncludes = options.RelativeIncludes
+                ? BuildIncludeLines(headers, libraryDirectory)
+                : rootIncludes;
+
+            // 附属库文件位于子目录，包含公共头/工具头需要向上一级
+            string commonInclude = library.IsPrimary
+                ? options.NativeName + ".h"
+                : "../" + options.NativeName + ".h";
+            string marshallerInclude = library.IsPrimary
+                ? CppMarshaller.FileName
+                : "../" + CppMarshaller.FileName;
 
             // 每个库一个公共实现文件：free_memory 只属于主库，Qt 连接销毁跟着主库走
             if (library.IsPrimary)
             {
                 _nativeFiles.Add(new(
                     library.Name + ".cpp",
-                    BuildCommonSource(includes, CommonOwner)));
+                    BuildCommonSource(rootIncludes, CommonOwner)));
             }
 
+            List<(string Owner, string Unique)> entries = [];
             foreach (string owner in library.Owners)
             {
-                ExportGroup group = GroupOf(owner);
                 string baseName = FileBaseName(owner);
                 string unique = baseName;
                 for (int suffix = 2; !usedBaseNames.Add(unique); suffix++)
                     unique = $"{baseName}_{suffix}";
+                entries.Add((owner, unique));
+            }
 
-                // 附属库文件位于子目录，包含公共头/工具头需要向上一级
-                string commonInclude = library.IsPrimary
-                    ? options.NativeName + ".h"
-                    : "../" + options.NativeName + ".h";
-                string marshallerInclude = library.IsPrimary
-                    ? CppMarshaller.FileName
-                    : "../" + CppMarshaller.FileName;
-                string headerName = unique + ".h";
-                _nativeFiles.Add(new(directory + headerName, BuildGroupHeader(owner, group, commonInclude)));
+            for (int start = 0; start < entries.Count; start += batchSize)
+            {
+                List<(string Owner, string Unique)> chunk =
+                    [.. entries.Skip(start).Take(batchSize)];
+
+                // 每个类仍保留独立头文件（供使用方与 C# 绑定生成读取）
+                foreach ((string owner, string unique) in chunk)
+                {
+                    ExportGroup group = GroupOf(owner);
+                    string headerName = unique + ".h";
+                    _nativeFiles.Add(new(
+                        directory + headerName,
+                        BuildGroupHeader(owner, group, commonInclude)));
+                    _generatedHeaders.Add(Path.Combine(nativeDirectory, directory + headerName));
+                }
+
+                string sourceBase = chunk[0].Unique;
+                if (chunk.Count > 1)
+                {
+                    sourceBase += "_batch";
+                    while (!usedBaseNames.Add(sourceBase))
+                        sourceBase += "_";
+                }
+
+                string includes = fallbackIncludes;
+                if (options.MinimalIncludes)
+                {
+                    HashSet<string> selected = new(StringComparer.Ordinal);
+                    foreach ((string owner, _) in chunk)
+                    {
+                        if (_groupHeaders.TryGetValue(owner, out HashSet<string>? ownerHeaders))
+                            selected.UnionWith(ownerHeaders);
+                    }
+
+                    // 类定义头排在最前：部分 Qt 头依赖先前包含的类型定义
+                    List<string> ordered = [];
+                    HashSet<string> added = new(StringComparer.Ordinal);
+                    foreach ((string owner, _) in chunk)
+                    {
+                        if (_ownerDefinitionHeaders.TryGetValue(owner, out string? definition)
+                            && selected.Contains(definition)
+                            && added.Add(definition))
+                        {
+                            ordered.Add(definition);
+                        }
+                    }
+
+                    foreach (string header in headers)
+                    {
+                        if (selected.Contains(header) && added.Add(header))
+                            ordered.Add(header);
+                    }
+
+                    if (ordered.Count > 0)
+                        includes = BuildIncludeLines(ordered, libraryDirectory);
+                }
+
+                List<(string Owner, ExportGroup Group)> groups =
+                    [.. chunk.Select(entry => (entry.Owner, GroupOf(entry.Owner)))];
                 _nativeFiles.Add(new(
-                    directory + unique + ".cpp",
-                    BuildGroupSource(owner, group, includes, marshallerInclude)));
-                _generatedHeaders.Add(Path.Combine(
-                    Path.GetFullPath(options.NativeOutput), directory + headerName));
+                    directory + sourceBase + ".cpp",
+                    BuildGroupSource(groups, includes, marshallerInclude)));
             }
         }
 
         _nativeFiles.Add(new(CppMarshaller.FileName, CppMarshaller.Source.Replace("\r\n", "\n") + "\n"));
+    }
+
+    /// <summary>
+    /// 生成 <c>#include</c> 行；<c>--relative-includes</c> 时路径相对给定目录，
+    /// 便于 ccache/sccache 在不同机器之间复用产物。
+    /// </summary>
+    private string BuildIncludeLines(IEnumerable<string> headers, string directory)
+        => string.Join("\n", headers.Select(header => $"#include \"{IncludePath(header, directory)}\""));
+
+    private string IncludePath(string header, string directory)
+    {
+        if (!options.RelativeIncludes)
+            return header.Replace('\\', '/');
+
+        string relative = Path.GetRelativePath(directory, header);
+        return (Path.IsPathRooted(relative) ? header : relative).Replace('\\', '/');
     }
 
     /// <summary>
@@ -2044,19 +2251,23 @@ internal sealed unsafe class CppRedirectGenerator(RootCommand options)
     }
 
     /// <summary>
-    /// 单个类的实现文件：独立翻译单元。
-    /// 刻意<b>不</b>包含该类头文件：头文件里的参数是 <c>demo_Widget*</c> 这类强类型句柄，
+    /// 一个或多个类的实现文件：独立翻译单元。
+    /// 刻意<b>不</b>包含类头文件：头文件里的参数是 <c>demo_Widget*</c> 这类强类型句柄，
     /// 而实现统一用 <c>void*</c> 承接，同名 extern "C" 函数签名不同会直接报错。
     /// 头文件只供使用方（以及 C# 绑定生成）读取。
     /// </summary>
-    private static string BuildGroupSource(string owner, ExportGroup group, string includes, string marshallerInclude)
+    private static string BuildGroupSource(
+        IReadOnlyList<(string Owner, ExportGroup Group)> groups,
+        string includes,
+        string marshallerInclude)
     {
-        string typedefs = string.Join("\n", group.SourceTypedefs);
-        string definitions = string.Join("\n\n", group.SourceDefinitions);
+        string owners = string.Join(" + ", groups.Select(group => group.Owner));
+        string typedefs = string.Join("\n", groups.SelectMany(group => group.Group.SourceTypedefs));
+        string definitions = string.Join("\n\n", groups.SelectMany(group => group.Group.SourceDefinitions));
 
         return Lf($$"""
             // 由 OBSharp.Interop.NativeBindGenerator --cpp-redirect 生成，请勿手工修改。
-            // 类：{{owner}}
+            // 类：{{owners}}
             #include "{{marshallerInclude}}"
             {{includes}}
 

@@ -50,6 +50,15 @@ public class RootCommand : ICExportGeneratorOptions
     [CliOption(Description = "--cpp-redirect 生成的 native 文件基名（.h / .cpp）")]
     public string NativeName { get; set; } = "cpp_exports";
 
+    [CliOption(Description = "为每个类只包含其导出实际用到的原始头文件（需配合 --cpp-redirect；可显著减少单个翻译单元的头文件数量）")]
+    public bool MinimalIncludes { get; set; }
+
+    [CliOption(Description = "把 --header 的路径写成相对 native 产物目录的形式，便于编译缓存跨机器复用（需配合 --cpp-redirect）")]
+    public bool RelativeIncludes { get; set; }
+
+    [CliOption(Description = "每 N 个类合并为一个 .cpp 翻译单元（需配合 --cpp-redirect；默认 1，即每个类一个 .cpp）")]
+    public int BatchSize { get; set; } = 1;
+
     /// <summary>
     /// <c>--</c> 之后原样传给 clang 的参数。
     /// </summary>
@@ -67,6 +76,12 @@ public class RootCommand : ICExportGeneratorOptions
 
         if (Qt && !CppRedirect)
             Console.Error.WriteLine("警告：--qt 仅在 --cpp-redirect 下生效，已忽略");
+
+        if (BatchSize < 1)
+        {
+            Console.Error.WriteLine("--batch-size 必须大于 0");
+            return 1;
+        }
 
         try
         {
