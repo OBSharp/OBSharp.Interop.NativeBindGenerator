@@ -16,4 +16,10 @@
     <PackageReference Include="Humanizer.Core" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- native 侧转换头文件随程序集发布，需要时从资源流释放到输出目录 -->
+    <EmbeddedResource Include="cpp_shim_marshal.hpp" />
+    <EmbeddedResource Include="qt_shim_marshal.hpp" />
+  </ItemGroup>
+
 </Project>

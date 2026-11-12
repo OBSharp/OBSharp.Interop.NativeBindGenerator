@@ -3,102 +3,17 @@ using DotMake.CommandLine;
 namespace OBSharp.Interop.NativeBindGenerator;
 
 /// <summary>
-/// 依据 C 导出声明生成 C# 绑定；可选地先为 C++ 类生成 C 式导出。
+/// 生成器入口；按子命令选择 C / C++ / Qt 三种流程。
 /// </summary>
 /// <remarks>
-/// 用法：<c>NativeBindGenerator [生成器参数] -- [clang 参数]</c>。
+/// 用法：<c>native-bind-generator &lt;c|cpp|qt&gt; [选项] -- [clang 参数]</c>。
 /// <c>--</c> 之后的所有参数原样交给 libclang，生成器不做任何内部处理。
+/// 根命令本身不执行生成逻辑，只把参数分发到子命令；未指定子命令时由 CLI 框架打印帮助。
 /// </remarks>
 [CliCommand(
-    Description = "依据 C 导出声明生成 C# 绑定；`--` 之后的参数原样传给 clang",
-    TreatUnmatchedTokensAsErrors = false)]
-public class RootCommand : ICExportGeneratorOptions
+    Description = "依据 C/C++/Qt 头文件生成 C# 绑定；`--` 之后的参数原样传给 clang",
+    TreatUnmatchedTokensAsErrors = false,
+    Children = [typeof(CppCommand), typeof(CCommand), typeof(QtCommand)])]
+public class RootCommand
 {
-    [CliOption(Description = "要解析的头文件；可重复指定")]
-    public string[] Header { get; set; } = [];
-
-    [CliOption(Alias = "n", Description = "生成 C# 代码的命名空间")]
-    public string Namespace { get; set; } = "OBSharp.Interop.Generated";
-
-    [CliOption(Alias = "l", Description = "LibraryImport 使用的原生库名")]
-    public string LibraryName { get; set; } = "native";
-
-    [CliOption(Description = "C# 产物目录")]
-    public string CsharpOutput { get; set; } = "generated/csharp";
-
-    [CliOption(Description = "bool 使用 4 字节（UnmanagedType.Bool），默认 1 字节（UnmanagedType.I1）")]
-    public bool FourByteBoolean { get; set; }
-
-    [CliOption(Description = "const char* 参数使用的自定义 marshaller 类型名，默认 LPUTF8Str")]
-    public string StringMarshaller { get; set; } = "";
-
-    [CliOption(Description = "const char* 返回值使用的自定义 marshaller 类型名，默认 LPUTF8Str")]
-    public string ReturnStringMarshaller { get; set; } = "";
-
-    [CliOption(Description = "可空句柄参数（Xxx? ↔ 原生 NULL）使用的自定义 marshaller 类型名；指定后句柄参数生成为 Xxx? 并附加 MarshalUsing")]
-    public string NullableHandleMarshaller { get; set; } = "";
-
-    [CliOption(Description = "变参函数只绑定定参部分（忽略变参实参）；默认跳过变参函数")]
-    public bool AllowVariadic { get; set; }
-
-    [CliOption(Description = "把 --header 中的 C++ 类自动转发为 C 式导出（生成 native 代码），再据此生成 C# 绑定")]
-    public bool CppRedirect { get; set; }
-
-    [CliOption(Description = "对 Qt 做特殊处理（需配合 --cpp-redirect）：信号转为 connect 导出、QObject 用 deleteLater 释放、QString 转 UTF-8")]
-    public bool Qt { get; set; }
-
-    [CliOption(Description = "--cpp-redirect 的 native 产物目录")]
-    public string NativeOutput { get; set; } = "generated/native";
-
-    [CliOption(Description = "--cpp-redirect 生成的 native 文件基名（.h / .cpp）")]
-    public string NativeName { get; set; } = "cpp_exports";
-
-    [CliOption(Description = "为每个类只包含其导出实际用到的原始头文件（需配合 --cpp-redirect；可显著减少单个翻译单元的头文件数量）")]
-    public bool MinimalIncludes { get; set; }
-
-    [CliOption(Description = "把 --header 的路径写成相对 native 产物目录的形式，便于编译缓存跨机器复用（需配合 --cpp-redirect）")]
-    public bool RelativeIncludes { get; set; }
-
-    [CliOption(Description = "每 N 个类合并为一个 .cpp 翻译单元（需配合 --cpp-redirect；默认 1，即每个类一个 .cpp）")]
-    public int BatchSize { get; set; } = 1;
-
-    /// <summary>
-    /// <c>--</c> 之后原样传给 clang 的参数。
-    /// </summary>
-    public string[] ClangArguments { get; private set; } = [];
-
-    public int Run(CliContext context)
-    {
-        ClangArguments = [.. context.Result.ParseResult.UnmatchedTokens];
-
-        if (Header is { Length: 0 })
-        {
-            Console.Error.WriteLine("必须通过 --header 至少指定一个头文件");
-            return 1;
-        }
-
-        if (Qt && !CppRedirect)
-            Console.Error.WriteLine("警告：--qt 仅在 --cpp-redirect 下生效，已忽略");
-
-        if (BatchSize < 1)
-        {
-            Console.Error.WriteLine("--batch-size 必须大于 0");
-            return 1;
-        }
-
-        try
-        {
-            if (CppRedirect)
-                new CppRedirectGenerator(this).Generate();
-            else
-                new CExportGenerator(this).Generate();
-        }
-        catch (InvalidOperationException ex)
-        {
-            Console.Error.WriteLine(ex.Message);
-            return 1;
-        }
-
-        return 0;
-    }
 }
