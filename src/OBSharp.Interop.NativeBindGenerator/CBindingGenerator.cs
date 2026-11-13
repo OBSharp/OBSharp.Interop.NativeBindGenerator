@@ -1070,10 +1070,16 @@ public sealed class CBindingGenerator(CBindingGeneratorOptions options) : ClangC
         if (parameter.Mapped.Type.EndsWith('*') is false)
             return false;
 
-        CXType pointee = canonical.PointeeType.CanonicalType;
+        // 泛型类型实参只能是值类型：指针、函数原型、数组等元素类型不能折叠成 Span，
+        // 否则 const char ** 会生成非法的 System.Span<byte*>
+        CXType pointee = Unwrap(canonical.PointeeType);
         return pointee.kind is not (CXTypeKind.CXType_Void
             or CXTypeKind.CXType_FunctionProto
-            or CXTypeKind.CXType_FunctionNoProto);
+            or CXTypeKind.CXType_FunctionNoProto
+            or CXTypeKind.CXType_Pointer
+            or CXTypeKind.CXType_ConstantArray
+            or CXTypeKind.CXType_IncompleteArray
+            or CXTypeKind.CXType_VariableArray);
     }
 
     /// <summary>
