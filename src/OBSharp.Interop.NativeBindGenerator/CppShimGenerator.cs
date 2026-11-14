@@ -259,11 +259,8 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
 
         // 未实例化的类模板本身不是类型：既不能 `new`，也不能在 C++ 侧以裸名出现（C2955）。
         // 在登记阶段就剔除，避免它的 _new/_finalize/成员导出进入产物
-        if (declaration.kind is CXCursorKind.CXCursor_ClassTemplate
-            or CXCursorKind.CXCursor_ClassTemplatePartialSpecialization)
-        {
+        if (IsUninstantiatedTemplate(declaration))
             return;
-        }
 
         uint key = KeyOf(declaration);
         if (TypeByKey.ContainsKey(key))
@@ -275,7 +272,11 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
             QualifiedName(declaration),
             ShimOptions.ExportPrefix + "_" + ToIdentifier(QualifiedName(declaration).Replace("::", "_", StringComparison.Ordinal)),
             CandidateHandleName(declaration),
-            RecordKeyword(declaration.kind));
+            RecordKeyword(declaration.kind))
+        {
+            // 翻译单元存活期间判定并缓存，供输出阶段的自检使用
+            IsUninstantiatedTemplate = IsUninstantiatedTemplate(declaration),
+        };
 
         TypeByKey.Add(key, type);
         Types.Add(type);
@@ -297,15 +298,67 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
         => ShimOptions.ExportPrefix + "_" + ToIdentifier(QualifiedName(declaration).Replace("::", "_", StringComparison.Ordinal));
 
     /// <summary>
+    /// 声明是否为「未实例化的类模板」：这种声明不是类型，既不能 <c>new</c>，也不能以裸名出现在 C++ 侧。
+    /// </summary>
+    /// <remarks>
+    /// 不能只靠 cursor kind：模板经常经 typedef/别名（如 <c>typedef QBasicAtomicInteger&lt;int&gt; QBasicAtomicInt;</c>）
+    /// 或作为参数/字段类型被间接引用，到达这里的 kind 可能是 <c>StructDecl</c>。
+    /// 因此组合多个判据，任一命中即视为未实例化模板。
+    /// </remarks>
+    private static bool IsUninstantiatedTemplate(CXCursor declaration)
+    {
+        if (declaration.kind is CXCursorKind.CXCursor_ClassTemplate
+            or CXCursorKind.CXCursor_ClassTemplatePartialSpecialization
+            or CXCursorKind.CXCursor_TypeAliasTemplateDecl)
+            return true;
+
+        // 模板实例必须能给出带参数列表的拼写；只有裸模板名说明没有实例化信息
+        CXType type = declaration.Type;
+        string spelling = type.Spelling.ToString();
+        if (spelling.Contains('<', StringComparison.Ordinal))
+            return false;
+
+        // libclang 只有在真正实例化后才报告模板参数个数
+        if (type.NumTemplateArguments > 0)
+            return false;
+
+        // 语义父级是模板声明，说明它是模板里的嵌套声明
+        CXCursor parent = declaration.SemanticParent;
+        while (!parent.IsNull && parent.kind is not CXCursorKind.CXCursor_TranslationUnit)
+        {
+            if (parent.kind is CXCursorKind.CXCursor_ClassTemplate
+                or CXCursorKind.CXCursor_ClassTemplatePartialSpecialization)
+            {
+                return true;
+            }
+
+            parent = parent.SemanticParent;
+        }
+
+        // 声明带特化标记 = 确实是某个模板的实例，不算未实例化
+        if (declaration.SpecializedCursorTemplate.IsNull is false && type.NumTemplateArguments is 0)
+            return false;
+
+        return false;
+    }
+
+    /// <summary>
     /// 已登记类型的句柄名；未登记时退化为按限定名即时换算（用于参数/返回值里的临时类型，例如
     /// Qt 私有嵌套类型与模板实例）。这种类型没有自己的成员导出，但同样要在头文件里补前置声明，
     /// 否则在 <c>extern "C"</c> 下会被编译器当成未知类型（MSVC 按 int 处理，Qt Core 产物因此编译失败）。
     /// </summary>
-    private string ResolveHandleName(CXCursor declaration)
+    /// <remarks>
+    /// 未实例化的类模板（如 <c>QBasicAtomicInteger</c>、<c>QAtomicOpsSupport</c>）没有合法 C 侧类型名，
+    /// 返回 <c>null</c> 让调用方降级为 <c>void*</c>，绝不产出裸模板名。
+    /// </remarks>
+    private string? ResolveHandleName(CXCursor declaration)
     {
         ShimTypeInfo? known = TypeByKey.GetValueOrDefault(KeyOf(declaration));
         if (known is not null)
             return known.HandleName;
+
+        if (IsUninstantiatedTemplate(declaration))
+            return null;
 
         string name = CandidateHandleName(declaration);
         HandleDeclarations.Add(name);
@@ -476,10 +529,27 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
 
         // 没有用户声明的构造函数时才补无参 new，但要求类型确实可默认构造：
         // 例如聚合类型里有成员不可默认构造、或默认构造被隐式删除时，`new X()` 会报 C2512/C2514
-        if (!HasUsableDefaultConstructor(definition))
+        if (!CanConstructDefault(definition))
             return;
 
         AddSynthetic(type, ShimRole.New, type.SymbolPrefix + "_new");
+    }
+
+    /// <summary>
+    /// 类型能否用 <c>new X()</c> 构造出实例。
+    /// </summary>
+    /// <remarks>
+    /// 比 <see cref="HasUsableDefaultConstructor"/> 更严格：除了字段可默认构造，
+    /// 还要求存在可调用的默认构造。<c>QAdoptSharedDataTag</c> 只声明了带参构造、
+    /// <c>QAbstractConcatenable</c> 只有删除的拷贝构造，二者都不能 <c>new X()</c>（C2514/C2641）。
+    /// </remarks>
+    private static bool CanConstructDefault(CXCursor definition)
+    {
+        // libclang 对「声明了任何构造函数」的类型不一定给出 NumCtors>0（模板里/被删除的情况尤其如此），
+        // 因此统一按「有可调用的无参构造 + 字段可默认构造」判定；
+        // 完全没有任何构造的类型由 HasDefaultConstructorOverload 的 count==0 分支放行（隐式默认构造）
+        return HasDefaultConstructorOverload(definition)
+            && HasUsableDefaultConstructor(definition);
     }
 
     /// <summary>
@@ -547,21 +617,24 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
     }
 
     /// <summary>
-    /// 记录类型是否有可调用的构造函数；无用户声明构造函数时视为有隐式默认构造。
+    /// 记录类型是否有可调用的无参构造函数；无用户声明构造函数时视为有隐式默认构造。
     /// </summary>
+    /// <remarks>
+    /// 只有「被删除的构造」或「全带参构造」时返回 false —— 这两种类型都无法 <c>new X()</c>。
+    /// </remarks>
     private static bool HasDefaultConstructorOverload(CXCursor definition)
     {
         int count = definition.NumCtors;
         if (count is 0)
             return true;
 
+        // 没有任何可用的无参构造就算不可默认构造；带参构造同理
         for (int i = 0; i < count; i++)
         {
             CXCursor ctor = definition.GetCtor((uint)i);
-            if (ctor.IsDeleted || ctor.IsImplicit)
+            if (ctor.IsDeleted)
                 continue;
 
-            // 只认真正的无参构造函数；带默认值的形参由 C++ 空实参规则调用，shim 侧不展开
             if (ctor.NumArguments is 0)
                 return true;
         }
@@ -573,6 +646,10 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
     {
         CXCursor definition = type.Declaration.Definition;
         if (definition.IsNull)
+            return;
+
+        // 不可构造的类型根本无法从 C 侧得到实例，析构导出只会是死代码（且容易随模板名一起编译失败）
+        if (IsUninstantiatedTemplate(definition) || !CanConstructDefault(definition))
             return;
 
         CXCursor destructor = definition.Destructor;
@@ -818,6 +895,14 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
         bool returnsEnum = role is not (ShimRole.New or ShimRole.Finalize)
             && Canonical(declaration.ResultType).kind is CXTypeKind.CXType_Enum;
 
+        // 返回位一致性校验：C 侧返回类型必须能承接 C++ 的实际返回值。
+        // 不满足就不生成该导出——宁可少一个绑定，也不要产出编译不过的产物（C2440）
+        if (role is not (ShimRole.New or ShimRole.Finalize)
+            && IsInconsistentReturn(declaration.ResultType, returnCType))
+        {
+            return;
+        }
+
         ShimFunctionInfo function = role switch
         {
             ShimRole.Method => new(
@@ -991,6 +1076,18 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
         };
 
     /// <summary>
+    /// 记录类型的 C 指针文本；未实例化模板等无合法 C 侧名称的情形降级为 <c>void*</c>。
+    /// </summary>
+    private string? HandlePointerOrNull(CXCursor declaration, string suffix)
+    {
+        string? handle = ResolveHandleName(declaration);
+        if (handle is null)
+            return "void" + suffix;
+
+        return handle + suffix;
+    }
+
+    /// <summary>
     /// 参数对应的 C 类型文本；返回 null 表示该类型无法桥接到 C。
     /// </summary>
     protected virtual string? ParameterCType(CXType canonical, bool indirect)
@@ -1004,7 +1101,7 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
                         return "void*";
 
                     if (pointee.kind is CXTypeKind.CXType_Record)
-                        return indirect ? ResolveHandleName(pointee.Declaration) + "**" : "void*";
+                        return indirect ? HandlePointerOrNull(pointee.Declaration, "**") : "void*";
 
                     string? scalar = ScalarCType(pointee);
                     return scalar is null ? null : scalar + "*";
@@ -1016,14 +1113,16 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
                     // 引用在 C 侧一律降级为指针，实现里再解引用
                     CXType pointee = Canonical(canonical.PointeeType);
                     if (pointee.kind is CXTypeKind.CXType_Record)
-                        return indirect ? ResolveHandleName(pointee.Declaration) + "**" : "void*";
+                        return indirect ? HandlePointerOrNull(pointee.Declaration, "**") : "void*";
 
                     string? scalar = ScalarCType(pointee);
                     return scalar is null ? null : scalar + "*";
                 }
 
             case CXTypeKind.CXType_Record:
-                return indirect ? ResolveHandleName(canonical.Declaration) + "**" : ResolveHandleName(canonical.Declaration) + "*";
+                return indirect
+                    ? HandlePointerOrNull(canonical.Declaration, "**")
+                    : HandlePointerOrNull(canonical.Declaration, "*");
 
             case CXTypeKind.CXType_Enum:
                 return "int32_t";
@@ -1077,7 +1176,11 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
             return "void";
 
         if (result.kind is CXTypeKind.CXType_Record)
-            return ResolveHandleName(result.Declaration) + "*";
+        {
+            // 按值返回的 record 一律不生成导出（C++ 侧返回的是对象本身），这里只服务剩余的指针语义场景；
+            // 未实例化模板同样降级为 void*
+            return HandlePointerOrNull(result.Declaration, "*");
+        }
 
         if (result.kind is CXTypeKind.CXType_Enum)
             return "int32_t";
@@ -1294,9 +1397,37 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
         return libraries;
     }
 
+    /// <summary>
+    /// 写出前的自检：登记为句柄的类型不允许是未实例化的类模板。
+    /// </summary>
+    /// <remarks>
+    /// 这类缺陷曾经两次漏到下游（C2955/C2641）。与其交付编译不过的产物，不如让生成直接失败并指出类型名。
+    /// 判据只依赖 libclang 的 AST 信息（cursor kind、模板参数个数、拼写），不维护名字黑名单——
+    /// 逐个列举名字必然会随版本漏网，这正是前几轮的教训。
+    /// **注意**：判定结果必须在登记阶段缓存（<see cref="ShimTypeInfo.IsUninstantiatedTemplate"/>），
+    /// 输出阶段翻译单元已失效，直接访问 cursor 会崩溃。
+    /// </remarks>
+    private void AssertNoBareTemplateNames()
+    {
+        List<string> offenders = [.. Types
+            .Where(type => type.IsUninstantiatedTemplate)
+            .Select(type => type.CppName)
+            .Distinct(StringComparer.Ordinal)
+            .OrderBy(name => name, StringComparer.Ordinal)];
+
+        if (offenders.Count is 0)
+            return;
+
+        throw new InvalidOperationException(
+            "生成的 shim 中出现了未实例化的类模板名，C++ 侧无法编译：" + string.Join(", ", offenders));
+    }
+
     protected virtual void WriteOutputs()
     {
         Directory.CreateDirectory(ShimOptions.Output.FullName);
+
+        // 写出前断言：绝不产出会在 C++ 侧编译失败的裸模板名（宁可生成失败，也不要静默交付坏产物）
+        AssertNoBareTemplateNames();
 
         string headerName = ShimOptions.BaseName + ".h";
         string pchName = ShimOptions.BaseName + ".pch.h";
@@ -1574,6 +1705,79 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
     }
 
     /// <summary>
+    /// 返回位是否与 C++ 实际返回值类型不兼容：一旦不兼容就说明 shim 会产出编译不过的代码。
+    /// </summary>
+    /// <remarks>
+    /// 覆盖三类实测问题：
+    /// ① C++ 返回记录/类类型，C 侧却被映射成 <c>void*</c> 或其它指针（<c>QByteArray → void*</c>、
+    ///    <c>const void* → void*</c>）；
+    /// ② C++ 返回标量，C 侧被映射成指针（<c>char → char*</c>）；
+    /// ③ C++ 返回值带 <c>const</c> 限定而 C 侧去掉了限定（<c>const char* → char*</c>）。
+    /// 枚举按 <c>static_cast</c> 处理，属于已知可转换的组合，不在此列。
+    /// </remarks>
+    private bool IsInconsistentReturn(CXType resultType, string returnCType)
+    {
+        CXType result = Canonical(resultType);
+        if (result.kind is CXTypeKind.CXType_Enum or CXTypeKind.CXType_Void)
+            return false;
+
+        bool cIsPointer = returnCType.EndsWith('*');
+        bool cIsVoidPointer = returnCType is "void*";
+
+        switch (result.kind)
+        {
+            // 记录/类类型按值返回：C 侧任何指针都无法承载（值不是指针）
+            case CXTypeKind.CXType_Record:
+                return true;
+
+            // 标量不可能"是指针"；映射出指针说明类型映射本身错了
+            case CXTypeKind.CXType_Bool
+                or CXTypeKind.CXType_Char_S
+                or CXTypeKind.CXType_Char_U
+                or CXTypeKind.CXType_SChar
+                or CXTypeKind.CXType_UChar
+                or CXTypeKind.CXType_Short
+                or CXTypeKind.CXType_UShort
+                or CXTypeKind.CXType_Int
+                or CXTypeKind.CXType_UInt
+                or CXTypeKind.CXType_Long
+                or CXTypeKind.CXType_ULong
+                or CXTypeKind.CXType_LongLong
+                or CXTypeKind.CXType_ULongLong
+                or CXTypeKind.CXType_Float
+                or CXTypeKind.CXType_Double:
+                return cIsPointer;
+
+            case CXTypeKind.CXType_Pointer:
+                {
+                    // 指针值可以隐式转成另一个指针，但丢 const 限定或语义完全不同的 void* 承接会产生 C2440
+                    if (cIsPointer is false)
+                        return true;
+
+                    CXType pointee = Canonical(result.PointeeType);
+                    bool cppConst = pointee.IsConstQualified;
+                    if (cppConst && cIsVoidPointer)
+                        return true;
+
+                    // const T* 不能喂给 T*
+                    string cppPointee = CppTypeOf(pointee);
+                    if (cppConst && returnCType is not "void*"
+                        && returnCType.StartsWith("const ", StringComparison.Ordinal) is false
+                        && cppPointee.StartsWith("const ", StringComparison.Ordinal) is false
+                        && cppPointee is not "char")
+                    {
+                        return true;
+                    }
+
+                    return false;
+                }
+
+            default:
+                return false;
+        }
+    }
+
+    /// <summary>
     /// 返回语句里的表达式：C 侧返回类型与 C++ 实际返回值不一致时补显式转换。
     /// </summary>
     /// <remarks>
@@ -1794,6 +1998,14 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
         /// 必须在翻译单元存活期间填好：输出阶段 <see cref="Declaration"/> 已失效，不能再访问 cursor。
         /// </remarks>
         public bool IsFrameworkType { get; set; }
+
+        /// <summary>
+        /// 登记时该声明是否为未实例化的类模板（输出阶段的自检依据）。
+        /// </summary>
+        /// <remarks>
+        /// 必须在翻译单元存活期间计算并缓存；输出阶段访问 cursor 会导致崩溃。
+        /// </remarks>
+        public bool IsUninstantiatedTemplate { get; set; }
     }
 
     /// <summary>
