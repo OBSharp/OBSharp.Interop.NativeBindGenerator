@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.RegularExpressions;
 
 using ClangSharp.Interop;
 
@@ -18,13 +19,18 @@ namespace OBSharp.Interop.NativeBindGenerator;
 /// 派生类（如 <c>QTShimGenerator</c>）通过覆盖 <see cref="SkipMember"/>、<see cref="ScalarCType"/>、
 /// <see cref="BuildToCppExpression"/> 等钩子实现框架特化，而不必复制整套发现与输出逻辑。
 /// </remarks>
-public class CppShimGenerator(CppShimGeneratorOptions options) : ClangCollector
+public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCollector
 {
     protected CppShimGeneratorOptions ShimOptions { get; } = options;
     protected List<ShimTypeInfo> Types { get; } = [];
     protected List<ShimFunctionInfo> Functions { get; } = [];
     protected Dictionary<uint, ShimTypeInfo> TypeByKey { get; } = [];
     protected HashSet<string> UsedSymbols { get; } = [with(StringComparer.Ordinal)];
+
+    /// <summary>
+    /// 源码文件行缓存：libclang 不暴露内联标志等语法信息，需要回读声明所在源码行判断。
+    /// </summary>
+    private readonly Dictionary<string, string[]> _sourceLines = [];
 
     /// <summary>
     /// 头文件里实际引用到的全部句柄类型名：已登记类型与临时换算类型都在此登记，按名字去重。
@@ -421,6 +427,18 @@ public class CppShimGenerator(CppShimGeneratorOptions options) : ClangCollector
         if (definition.IsNull)
             return;
 
+        // 类模板本身不是类型，`new QTypeInfo()` 这种写法无法编译（C2955/C2641）；
+        // 它的实例化由参数/返回值位置按需以降级类型出现，不需要构造导出
+        if (definition.kind is CXCursorKind.CXCursor_ClassTemplate
+            or CXCursorKind.CXCursor_ClassTemplatePartialSpecialization)
+        {
+            return;
+        }
+
+        // 抽象类无法实例化（C2259），不能为它生成 new 导出
+        if (definition.CXXRecord_IsAbstract)
+            return;
+
         int count = definition.NumCtors;
         bool hasExplicit = false;
         for (int i = 0; i < count; i++)
@@ -436,11 +454,102 @@ public class CppShimGenerator(CppShimGeneratorOptions options) : ClangCollector
             hasExplicit = true;
         }
 
-        if (!hasExplicit && definition.CXXRecord_IsAbstract is false)
+        if (hasExplicit)
+            return;
+
+        // 没有用户声明的构造函数时才补无参 new，但要求类型确实可默认构造：
+        // 例如聚合类型里有成员不可默认构造、或默认构造被隐式删除时，`new X()` 会报 C2512/C2514
+        if (!HasUsableDefaultConstructor(definition))
+            return;
+
+        AddSynthetic(type, ShimRole.New, type.SymbolPrefix + "_new");
+    }
+
+    /// <summary>
+    /// 类型能否用 <c>new X()</c> 默认构造。
+    /// </summary>
+    /// <remarks>
+    /// 只看“没有用户声明的构造函数”还不够：统一初始化语法、引用成员、常量成员等情况会让
+    /// 隐式默认构造函数被删除。逐个字段检查可默认构造性，任一字段不满足即视为不可默认构造，
+    /// 宁可少一个构造导出，也不要生成编译不过的 shim。
+    /// </remarks>
+    private static bool HasUsableDefaultConstructor(CXCursor definition)
+    {
+        int fieldCount = definition.NumFields;
+        for (int i = 0; i < fieldCount; i++)
         {
-            // 没有用户声明的构造函数时补一个无参 new，保证 C# 侧总能创建实例
-            AddSynthetic(type, ShimRole.New, type.SymbolPrefix + "_new");
+            CXCursor field = definition.GetField((uint)i);
+            if (!IsDefaultConstructible(field.Type))
+                return false;
         }
+
+        return true;
+    }
+
+    /// <summary>
+    /// 字段类型是否可默认构造：标量/枚举/指针天然可以，记录类型递归判断，数组按元素判断。
+    /// </summary>
+    private static bool IsDefaultConstructible(CXType type, int depth = 0)
+    {
+        if (depth > 4)
+            return false;
+
+        CXType canonical = Canonical(type);
+        switch (canonical.kind)
+        {
+            case CXTypeKind.CXType_Record:
+                {
+                    CXCursor declaration = canonical.Declaration;
+                    CXCursor definition = declaration.Definition;
+                    if (definition.IsNull)
+                        return false;
+
+                    if (definition.kind is CXCursorKind.CXCursor_ClassTemplate
+                        or CXCursorKind.CXCursor_ClassTemplatePartialSpecialization)
+                    {
+                        return false;
+                    }
+
+                    if (definition.CXXRecord_IsAbstract)
+                        return false;
+
+                    // 有用户声明的构造函数时，只有存在无参重载才算可默认构造
+                    return HasDefaultConstructorOverload(definition)
+                        && HasUsableDefaultConstructor(definition);
+                }
+
+            case CXTypeKind.CXType_ConstantArray:
+                return IsDefaultConstructible(canonical.ArrayElementType, depth + 1);
+
+            case CXTypeKind.CXType_Void:
+                return false;
+
+            default:
+                return true;
+        }
+    }
+
+    /// <summary>
+    /// 记录类型是否有可调用的构造函数；无用户声明构造函数时视为有隐式默认构造。
+    /// </summary>
+    private static bool HasDefaultConstructorOverload(CXCursor definition)
+    {
+        int count = definition.NumCtors;
+        if (count is 0)
+            return true;
+
+        for (int i = 0; i < count; i++)
+        {
+            CXCursor ctor = definition.GetCtor((uint)i);
+            if (ctor.IsDeleted || ctor.IsImplicit)
+                continue;
+
+            // 只认真正的无参构造函数；带默认值的形参由 C++ 空实参规则调用，shim 侧不展开
+            if (ctor.NumArguments is 0)
+                return true;
+        }
+
+        return false;
     }
 
     protected virtual void AppendFinalizer(ShimTypeInfo type)
@@ -552,11 +661,105 @@ public class CppShimGenerator(CppShimGeneratorOptions options) : ClangCollector
         if (name.Length is 0)
             return;
 
+        // 头文件里还混着 Qt 的宏/内联工具函数与 CRT 的静态链接函数（qt_noop、qBadAlloc、
+        // qYieldCpu、qSNaN、qQNaN、__security_init_cookie、_invalid_parameter_noinfo 等）。
+        // 它们不是库的公开导出，生成 C 导出会与头顶已声明的同名实体冲突（C2375/C2732/C2475），
+        // 且包装体调用同名函数会自我递归。
+        if (IsNonBindableFreeFunction(declaration, name))
+            return;
+
         if (IsSupportedReturn(declaration.ResultType) is false)
             return;
 
         AddFunction(null, declaration, ShimRole.Free, ToIdentifier(name));
     }
+
+    /// <summary>
+    /// 无宿主前缀的自由函数是否不应成为 C 导出：内联函数、Qt 的 <c>q*</c> 工具函数、CRT 保留名。
+    /// </summary>
+    /// <remarks>
+    /// 只针对**没有** <c>--export-prefix</c> 前缀的名字：带前缀的自由函数是调用方用该前缀
+    /// 明确约定引入的导出，即使名字看起来像 Qt 宏也照常生成。
+    /// </remarks>
+    private bool IsNonBindableFreeFunction(CXCursor declaration, string name)
+    {
+        // 内联函数没有稳定的导出地址，链接器不会为它产生符号
+        if (IsInlineFunction(declaration))
+            return true;
+
+        if (name.StartsWith(ShimOptions.ExportPrefix, StringComparison.Ordinal))
+            return false;
+
+        if (NonBindableFunctionNames.Contains(name))
+            return true;
+
+        // CRT 的静态链接函数使用下划线保留名（__security_*、_invalid_parameter_* 等）
+        return name.StartsWith('_') && LooksLikeCrtReservedName(name);
+    }
+
+    /// <summary>
+    /// 声明是否为内联函数。
+    /// </summary>
+    /// <remarks>
+    /// libclang 不直接暴露该标志，按声明所在源码行的关键字判断；
+    /// 同时覆盖 MSVC 的 <c>__inline</c> / <c>__forceinline</c> 与 GNU 的 <c>inline</c>。
+    /// </remarks>
+    private bool IsInlineFunction(CXCursor declaration)
+    {
+        declaration.Location.GetExpansionLocation(out CXFile file, out uint line, out _, out _);
+        string path = file.Name.ToString();
+        if (path.Length is 0 || line is 0)
+            return false;
+
+        if (!_sourceLines.TryGetValue(path, out string[]? lines))
+        {
+            if (!File.Exists(path))
+                return false;
+
+            lines = File.ReadAllLines(path);
+            _sourceLines[path] = lines;
+        }
+
+        int offset = (int)line - 1;
+        if (offset >= lines.Length)
+            return false;
+
+        // 声明可能跨行书写，把该行与下一行拼起来看关键字
+        string text = offset + 1 < lines.Length ? lines[offset] + " " + lines[offset + 1] : lines[offset];
+        return InlineKeywordRegex.IsMatch(text);
+    }
+
+    /// <summary>
+    /// 源码行里出现 <c>inline</c> / <c>__inline</c> / <c>__forceinline</c> 关键字（按标识符边界匹配，避免误伤子串）。
+    /// </summary>
+    [GeneratedRegex(@"(?<![A-Za-z0-9_])(inline|__inline|__forceinline|__inline__)(?![A-Za-z0-9_])", RegexOptions.Compiled | RegexOptions.CultureInvariant)]
+    private static partial Regex InlineKeywordRegex { get; }
+
+    /// <summary>
+    /// 不应导出为 C 接口的函数名：Qt 工具函数与 CRT 静态链接函数。
+    /// </summary>
+    private static readonly HashSet<string> NonBindableFunctionNames =
+    [
+        "qt_noop",
+        "__security_init_cookie",
+        "__security_check_cookie",
+        "_invalid_parameter_noinfo",
+        "_invalid_parameter_noinfo_noreturn",
+        "__report_rangecheckfailure",
+        "__CxxThrowException",
+        "_RTC_InitBase",
+        "_RTC_Shutdown",
+    ];
+
+    /// <summary>
+    /// 形如 <c>__*</c> / <c>_*</c> 且带工具集气息的保留名；用于兜住 CRT 未来的同类静态函数。
+    /// </summary>
+    private static bool LooksLikeCrtReservedName(string name)
+        => name.Contains("parameter", StringComparison.OrdinalIgnoreCase)
+            || name.Contains("security", StringComparison.OrdinalIgnoreCase)
+            || name.Contains("initterm", StringComparison.OrdinalIgnoreCase)
+            || name.Contains("exe_entry", StringComparison.OrdinalIgnoreCase)
+            || name.Contains("call_reportfault", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>
     /// 记录一个导出项，并按参数类型生成唯一符号名。
