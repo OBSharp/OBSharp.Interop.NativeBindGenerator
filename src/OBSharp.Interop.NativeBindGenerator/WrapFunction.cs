@@ -10,6 +10,11 @@ public sealed class WrapFunction
     public required string MemberName { get; init; }
 
     /// <summary>
+    /// 额外的 XML 注释行（已含 <c>///</c> 前缀）；为空时只输出原生名说明。
+    /// </summary>
+    public IReadOnlyList<string> CommentLines { get; init; } = [];
+
+    /// <summary>
     /// 封装方法的返回类型；返回 Span 时该类型为 <c>Span&lt;T&gt;</c> 或 <c>ReadOnlySpan&lt;T&gt;</c>。
     /// </summary>
     public string ReturnType { get; init; } = "void";

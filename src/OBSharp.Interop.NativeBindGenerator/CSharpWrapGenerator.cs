@@ -16,9 +16,10 @@ public sealed class CSharpWrapGenerator(CSharpWrapGeneratorOptions options)
         string call = BuildCall(function);
 
         if (!NeedsBlock(function))
-            return $"{signature} => {call};";
+            return JoinComments(function.CommentLines, $"{signature} => {call};");
 
         using StringWriter writer = CreateWriter();
+        WriteComments(writer, function.CommentLines);
         writer.WriteLine(signature);
         writer.WriteLine("{");
         WriteBlockBody(writer, function, call);
@@ -32,6 +33,7 @@ public sealed class CSharpWrapGenerator(CSharpWrapGeneratorOptions options)
     public static string EmitProperty(WrapProperty property)
     {
         using StringWriter writer = CreateWriter();
+        WriteComments(writer, property.CommentLines);
         writer.Write(property.IsStatic ? "public static " : "public ");
         writer.Write(property.Type);
         writer.Write(' ');
@@ -231,6 +233,18 @@ public sealed class CSharpWrapGenerator(CSharpWrapGeneratorOptions options)
         => readOnly
             ? $"global::System.ReadOnlySpan<{elementType}>"
             : $"global::System.Span<{elementType}>";
+
+    /// <summary>
+    /// 把注释行拼到表达式体成员之前，保持「注释 + 单行成员」的紧凑形态。
+    /// </summary>
+    private static string JoinComments(IReadOnlyList<string> comments, string member)
+        => comments.Count is 0 ? member : string.Join("\r\n", comments) + "\r\n" + member;
+
+    private static void WriteComments(StringWriter writer, IReadOnlyList<string> comments)
+    {
+        foreach (string comment in comments)
+            writer.WriteLine(comment);
+    }
 
     // ---- 输出 ----
 
