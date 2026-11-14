@@ -223,11 +223,9 @@ public sealed partial class QTShimGenerator(QTShimGeneratorOptions options) : Cp
             cppTypes.Add(CppTypeOf(Canonical(argument.Type)));
             lambdaParameters.Add(cppTypes[i] + " p" + i.ToString(CultureInfo.InvariantCulture));
 
-            // C 侧记录类型形参是句柄指针，而 Qt 的信号实参是按值传来的对象（QPrivateSignal 等），
-            // 必须取地址才能匹配回调的形参类型，否则 C2664
-            lambdaArguments.Add(NeedsAddressOf(argument, parameter)
-                ? "&p" + i.ToString(CultureInfo.InvariantCulture)
-                : "p" + i.ToString(CultureInfo.InvariantCulture));
+            // 回调实参必须与 C 形参**同源**：形参是 void* / 句柄指针时，实参也要是同一层级的指针，
+            // 否则按值对象接不进 void*（C2664）；已是指针的实参不能再取一次地址
+            lambdaArguments.Add(SignalArgument(argument, parameter, i));
         }
 
         string callbackName = UniqueSymbol(type.SymbolPrefix + "_" + snake + "_callback");
@@ -251,17 +249,23 @@ public sealed partial class QTShimGenerator(QTShimGeneratorOptions options) : Cp
     /// 回调实参是否需要取地址：C 侧形参是指针（句柄或 T*）而 C++ 实参是按值对象时。
     /// </summary>
     /// <remarks>
-    /// <c>QPrivateSignal</c> 这类按值传递的参数在 C 侧被降级成 <c>cpp_shim_*</c> 句柄指针，
-    /// lambda 里必须传 <c>&amp;pN</c> 才能匹配回调 typedef 的形参类型。
+    /// 回调形参 <c>parameter.CType</c> 由 <see cref="CppShimGenerator.BuildParameter"/> 推导，
+    /// 实参表达式必须**与它同源**，否则会出现两类错误：
+    /// ① 形参是 <c>void*</c>（记录类型按值被降级）而实参按值传对象 → C2664；
+    /// ② 形参是非透明句柄指针而已经是指针的实参又被取一次地址 → 指针套指针 → C2664。
+    /// 因此这里按「C 形参是否需要指针」+「C++ 实参本身是否已是指针」二维判定。
     /// </remarks>
-    private static bool NeedsAddressOf(CXCursor argument, ShimParameterInfo parameter)
+    private static string SignalArgument(CXCursor argument, ShimParameterInfo parameter, int index)
     {
+        string name = "p" + index.ToString(CultureInfo.InvariantCulture);
         string cType = parameter.CType ?? "";
-        if (!cType.EndsWith('*'))
-            return false;
+        if (cType.EndsWith('*') is false)
+            return name;
 
-        // 指针/引用类型的实参本身就是指针语义，不应再取地址
-        return Canonical(argument.Type).kind is CXTypeKind.CXType_Record;
+        // 实参本身已经是指针（QPrivateSignal*、QWidget* 等）：直接强转为 C 侧句柄指针，不再取址
+        return Canonical(argument.Type).kind is CXTypeKind.CXType_Pointer
+            ? "reinterpret_cast<" + cType + ">(" + name + ")"
+            : "&" + name;
     }
 
     /// <summary>

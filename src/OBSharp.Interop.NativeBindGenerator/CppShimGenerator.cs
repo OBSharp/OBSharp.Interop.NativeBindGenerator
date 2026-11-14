@@ -654,6 +654,11 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
     /// <remarks>
     /// 只有「被删除的构造」或「全带参构造」时返回 false —— 这两种类型都无法 <c>new X()</c>。
     /// </remarks>
+    /// <remarks>
+    /// 必须同时要求构造函数的访问权限是 <c>public</c>：Qt 里 <c>QCborValueRef</c>（private）、
+    /// <c>QFileDevice</c>（protected）、<c>QStringConverterBase</c>（protected）都有无参构造，
+    /// 但从外部 <c>new</c> 会直接报 C2248。
+    /// </remarks>
     private static bool HasDefaultConstructorOverload(CXCursor definition)
     {
         int count = definition.NumCtors;
@@ -667,7 +672,11 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
             if (ctor.IsDeleted)
                 continue;
 
-            if (ctor.NumArguments is 0)
+            if (ctor.NumArguments is not 0)
+                continue;
+
+            // 只有 public 的无参构造函数才能从 shim 里 `new` 出来
+            if (ctor.CXXAccessSpecifier is CX_CXXAccessSpecifier.CX_CXXPublic)
                 return true;
         }
 
@@ -1500,6 +1509,71 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
     /// 就说明产物编译不过，直接让生成失败并列出类型名。
     /// 判据仍只依赖 AST/文本本身，不维护名字黑名单——逐个列举必然随版本漏网。
     /// </remarks>
+    /// <summary>
+    /// 写出前自检：函数体里不得出现「与形参同名的局部变量声明」。
+    /// </summary>
+    /// <remarks>
+    /// <c>QMetaContainer::copyIterator(void* target, void* source)</c> 曾因固定的 <c>auto* target</c>
+    /// 与形参重名而报 C2082。局部名现在由 <see cref="LocalSelfName"/> 动态避让，这里做兜底校验。
+    /// 判据只看生成的文本，与任何 AST 判定无关。
+    /// </remarks>
+    private static void AssertNoLocalShadowsParameter(IEnumerable<GeneratedFile> files)
+    {
+        List<string> offenders = [];
+        foreach (GeneratedFile file in files)
+        {
+            if (file.Name.EndsWith(".cpp", StringComparison.Ordinal) is false)
+                continue;
+
+            foreach (Match match in LocalDeclarationRegex.Matches(file.Content))
+            {
+                string localName = match.Groups["name"].Value;
+                string parameterList = match.Groups["params"].Value;
+                if (DeclaresParameter(parameterList, localName)
+                    && offenders.Contains(localName, StringComparer.Ordinal) is false)
+                {
+                    offenders.Add(localName);
+                }
+            }
+        }
+
+        if (offenders.Count is 0)
+            return;
+
+        offenders.Sort(StringComparer.Ordinal);
+        throw new InvalidOperationException(
+            "生成的 shim 中出现了与形参同名的局部变量，C++ 侧无法编译：" + string.Join(", ", offenders));
+    }
+
+    /// <summary>
+    /// 形参表里是否声明了某个名字（形参形如 <c>类型 名字</c>，名字取最后一个标识符）。
+    /// </summary>
+    private static bool DeclaresParameter(string parameterList, string name)
+    {
+        foreach (string part in parameterList.Split(','))
+        {
+            string text = part.Trim();
+            if (text.Length is 0 || text is "void")
+                continue;
+
+            string[] words = [.. text.Split(' ', StringSplitOptions.RemoveEmptyEntries)];
+            if (words.Length is not 0 && words[^1] == name)
+                return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// 函数定义头 + 紧随其后的函数体局部声明；分别捕获形参表与局部变量名。
+    /// </summary>
+    /// <remarks>
+    /// 只匹配 <c>CPP_SHIM_CALL ... (形参表)</c> 后第一个花括号块内的 <c>auto* 名字</c> 声明，
+    /// 这是本生成器唯一会写出的局部变量形态，因此不必做完整的 C++ 语法解析。
+    /// </remarks>
+    [GeneratedRegex(@"CPP_SHIM_CALL[^\r\n]*\((?<params>[^)]*)\)\s*\r?\n\{\s*\r?\n\s*auto\* (?<name>[A-Za-z_][A-Za-z0-9_]*)\s*=", RegexOptions.Compiled | RegexOptions.CultureInvariant)]
+    private static partial Regex LocalDeclarationRegex { get; }
+
     private static void AssertNoBareTemplateNames(IEnumerable<GeneratedFile> files, HashSet<string> templateNames)
     {
         if (templateNames.Count is 0)
@@ -1610,6 +1684,9 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
 
         // 写出前断言：扫描实际输出文本中的已知模板名（名单来自 AST 判定，不维护手写黑名单）
         AssertNoBareTemplateNames(Files, UninstantiatedTemplateNames());
+
+        // 写出前断言：局部变量不得与形参重名（C2082）
+        AssertNoLocalShadowsParameter(Files);
 
         // 写正文，再释放嵌入的转换头文件，最后清理本轮未产出的旧产物
         foreach (GeneratedFile file in Files)
@@ -1848,8 +1925,11 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
 
             case ShimRole.Method:
                 {
-                    writer.WriteLine("    auto* target = reinterpret_cast<" + function.Owner!.CppName + "*>(self);");
-                    string call = "target->" + function.MethodName + "(" + ArgumentList(function) + ")";
+                    // 局部变量名必须避开形参：`QMetaContainer::copyIterator(void* target, void* source)`
+                    // 的形参就叫 target，固定名会让函数体里 `auto* target` 形参重定义（C2082）
+                    string local = LocalSelfName(function);
+                    writer.WriteLine("    auto* " + local + " = reinterpret_cast<" + function.Owner!.CppName + "*>(self);");
+                    string call = local + "->" + function.MethodName + "(" + ArgumentList(function) + ")";
                     writer.WriteLine(function.ReturnsVoid ? "    " + call + ";" : "    return " + ReturnExpression(function, call) + ";");
                     break;
                 }
@@ -1922,10 +2002,11 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
                         return true;
 
                     CXType pointee = Canonical(result.PointeeType);
-                    bool cppConst = pointee.IsConstQualified;
+                    bool cppConst = pointee.IsConstQualified || result.PointeeType.IsConstQualified;
 
                     // const T* 不能喂给 T*：C 层必须保留 const 限定（Qt 的 constData()/const_iterator 大量踩中）
-                    if (pointee.IsConstQualified && returnCType.StartsWith("const ", StringComparison.Ordinal) is false)
+                    // 注意要连同未剥壳的 pointee 一起看：storage_type 这类 typedef 剥壳后可能丢掉 const
+                    if (cppConst && returnCType.StartsWith("const ", StringComparison.Ordinal) is false)
                         return true;
 
                     // T* 的 T 必须是能桥接成 C 标量的类型；用户自定义类型（迭代器、嵌套常量等）拼不出合法 C 指针
@@ -1942,6 +2023,22 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
             default:
                 return false;
         }
+    }
+
+    /// <summary>
+    /// 实例方法体里指向宿主的局部变量名：固定从 <c>target</c> 开始，与任何形参重名时追加下划线。
+    /// </summary>
+    /// <remarks>
+    /// 形参名来自原生声明，无法预先约束，因此局部名必须动态避让；
+    /// 这与「能力方法是成员」无关，只是同一作用域内的名字冲突。
+    /// </remarks>
+    private static string LocalSelfName(ShimFunctionInfo function)
+    {
+        string name = "target";
+        while (function.Parameters.Any(parameter => parameter.Name == name))
+            name += "_";
+
+        return name;
     }
 
     /// <summary>
