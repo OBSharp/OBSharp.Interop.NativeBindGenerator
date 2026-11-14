@@ -746,8 +746,21 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
 
         CXCursor destructor = definition.Destructor;
         if (destructor.IsNull)
+        {
             AddSynthetic(type, ShimRole.Finalize, type.SymbolPrefix + "_finalize");
-        else if (SkipMember(destructor) is false)
+            return;
+        }
+
+        // 析构函数不可访问时不能生成 `delete`：QSessionManager 的析构是 private，
+        // SkipMember 对「非函数类成员」的可见性判定不一定覆盖到它，这里显式再判一次
+        if (destructor.IsDeleted
+            || (destructor.CXXAccessSpecifier is not (CX_CXXAccessSpecifier.CX_CXXInvalidAccessSpecifier
+                or CX_CXXAccessSpecifier.CX_CXXPublic)))
+        {
+            return;
+        }
+
+        if (SkipMember(destructor) is false)
             AddFunction(type, destructor, ShimRole.Finalize, type.SymbolPrefix + "_finalize");
     }
 
@@ -2794,4 +2807,9 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
         public string ToCppExpression { get; } = toCppExpression;
     }
 }
+
+
+
+
+
 

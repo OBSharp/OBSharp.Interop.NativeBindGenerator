@@ -253,6 +253,10 @@ public sealed partial class QTShimGenerator(QTShimGeneratorOptions options) : Cp
             if (IsSignal(method) is false || method.IsImplicit || method.CXXMethod_IsStatic)
                 continue;
 
+            // 信号连接会生成 `&Class::member`：被删除的成员（如 QDateEdit 的拷贝赋值）取地址会引用已删除函数（C2280）
+            if (method.IsDeleted)
+                continue;
+
             // 连接导出会生成 `&Class::member` 取成员函数地址：非 public 的成员在此处不可访问
             // （Qt 的 resetInternalData 是 protected slot，取地址会报 C2248）
             if (IsMemberAddressable(method) is false)
@@ -285,8 +289,13 @@ public sealed partial class QTShimGenerator(QTShimGeneratorOptions options) : Cp
 
             parameters.Add(parameter);
             cppTypes.Add(CppTypeOf(Canonical(argument.Type)));
-            lambdaParameters.Add(cppTypes[i] + " p" + i.ToString(CultureInfo.InvariantCulture));
 
+            // 按值传参的 lambda 形参会触发拷贝构造 + 析构；若该类型的析构不可访问
+            // （QSessionManager 的析构是 private），连接表达式会引用私有析构（C2248）。
+            // 这类参数改用 const 引用传递，不构造也不析构
+            lambdaParameters.Add(IsCopyableSignalParameter(argument)
+                ? cppTypes[i] + " p" + i.ToString(CultureInfo.InvariantCulture)
+                : "const " + cppTypes[i] + "& p" + i.ToString(CultureInfo.InvariantCulture));
             // 回调实参必须与 C 形参**同源**：形参是 void* / 句柄指针时，实参也要是同一层级的指针，
             // 否则按值对象接不进 void*（C2664）；已是指针的实参不能再取一次地址
             lambdaArguments.Add(SignalArgument(argument, parameter, i));
@@ -307,6 +316,34 @@ public sealed partial class QTShimGenerator(QTShimGeneratorOptions options) : Cp
             connectionType + "*",
             parametersDeclaration,
             body);
+    }
+
+    /// <summary>
+    /// 信号形参能否按值传递：记录类型的析构必须可访问，否则 lambda 按值接参会在表达式里引用私有析构。
+    /// </summary>
+    /// <remarks>
+    /// 非记录类型（标量、指针）按值传递不涉及析构，一律允许。
+    /// </remarks>
+    private static bool IsCopyableSignalParameter(CXCursor argument)
+    {
+        CXType shape = Canonical(argument.Type);
+        if (shape.kind is not CXTypeKind.CXType_Record)
+            return true;
+
+        CXCursor declaration = shape.Declaration;
+        if (declaration.IsNull)
+            return true;
+
+        CXCursor definition = declaration.Definition;
+        if (definition.IsNull)
+            return true;
+
+        CXCursor destructor = definition.Destructor;
+        if (destructor.IsNull)
+            return true;
+
+        return destructor.CXXAccessSpecifier is CX_CXXAccessSpecifier.CX_CXXInvalidAccessSpecifier
+            or CX_CXXAccessSpecifier.CX_CXXPublic;
     }
 
     /// <summary>
@@ -809,3 +846,5 @@ public sealed partial class QTShimGenerator(QTShimGeneratorOptions options) : Cp
         return matches > 1;
     }
 }
+
+
