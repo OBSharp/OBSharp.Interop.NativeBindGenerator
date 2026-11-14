@@ -389,6 +389,11 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
         if (known is not null)
             return known.HandleName;
 
+        // 对调用方不可见的类型（private/protected 的嵌套类、enum、辅助声明）不能出现在 C 侧：
+        // 即使只是拿它的指针，C 端也会因为命名空间可见性报 C2248（QLibrary::LoadStatusTag 就是这样）
+        if (IsVisibleToCaller(declaration) is false)
+            return null;
+
         if (IsUninstantiatedTemplate(declaration))
             return null;
 
@@ -396,6 +401,17 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
         HandleDeclarations.Add(name);
         return name;
     }
+
+    /// <summary>
+    /// 声明对调用方是否可见：命名空间作用域或 <c>public</c> 区。
+    /// </summary>
+    /// <remarks>
+    /// 与 <see cref="IsAccessible"/> 语义一致，但额外用于「未登记类型」的即时换算路径；
+    /// <c>private</c>/<c>protected</c> 的嵌套声明即便只是取地址也会触发 C2248。
+    /// </remarks>
+    protected virtual bool IsVisibleToCaller(CXCursor declaration)
+        => declaration.CXXAccessSpecifier is CX_CXXAccessSpecifier.CX_CXXInvalidAccessSpecifier
+            or CX_CXXAccessSpecifier.CX_CXXPublic;
 
     private void EnsureFieldDependencies(ShimTypeInfo type)
     {

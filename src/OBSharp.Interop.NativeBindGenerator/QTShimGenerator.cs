@@ -250,10 +250,12 @@ public sealed partial class QTShimGenerator(QTShimGeneratorOptions options) : Cp
     /// </summary>
     /// <remarks>
     /// 回调形参 <c>parameter.CType</c> 由 <see cref="CppShimGenerator.BuildParameter"/> 推导，
-    /// 实参表达式必须**与它同源**，否则会出现两类错误：
-    /// ① 形参是 <c>void*</c>（记录类型按值被降级）而实参按值传对象 → C2664；
-    /// ② 形参是非透明句柄指针而已经是指针的实参又被取一次地址 → 指针套指针 → C2664。
-    /// 因此这里按「C 形参是否需要指针」+「C++ 实参本身是否已是指针」二维判定。
+    /// 实参表达式必须**与它的类型恰好一致**。关键点：<c>cpp_shim_X</c> 是不透明句柄 struct
+    /// （<c>typedef struct cpp_shim_X cpp_shim_X;</c>），与 C++ 的 <c>X</c> 是**两个不同的 struct**，
+    /// 因此无论实参是值还是指针，都必须显式 <c>reinterpret_cast</c> 到形参类型：
+    /// ① 形参是 <c>void*</c>（记录按值被降级）：值实参取址后再转 <c>void*</c>；
+    /// ② 形参是句柄指针：值实参 <c>reinterpret_cast&lt;T*&gt;(&amp;p)</c>，指针实参 <c>reinterpret_cast&lt;T*&gt;(p)</c>；
+    /// ③ 形参是标量：原样传递。
     /// </remarks>
     private static string SignalArgument(CXCursor argument, ShimParameterInfo parameter, int index)
     {
@@ -262,10 +264,15 @@ public sealed partial class QTShimGenerator(QTShimGeneratorOptions options) : Cp
         if (cType.EndsWith('*') is false)
             return name;
 
-        // 实参本身已经是指针（QPrivateSignal*、QWidget* 等）：直接强转为 C 侧句柄指针，不再取址
-        return Canonical(argument.Type).kind is CXTypeKind.CXType_Pointer
-            ? "reinterpret_cast<" + cType + ">(" + name + ")"
-            : "&" + name;
+        // 实参已是指针：直接强转为形参类型（不取址，否则指针套指针）
+        if (Canonical(argument.Type).kind is CXTypeKind.CXType_Pointer)
+            return "reinterpret_cast<" + cType + ">(" + name + ")";
+
+        // 实参是值：先取址，再强转为形参类型。
+        // 取址得到的是 C++ 类型指针（如 QPrivateSignal*），而形参是不透明句柄指针
+        // （cpp_shim_*_QPrivateSignal*）——两者是不同的 struct，缺这一步转换就会报 C2664
+        string address = "&" + name;
+        return cType is "void*" ? address : "reinterpret_cast<" + cType + ">(" + address + ")";
     }
 
     /// <summary>
