@@ -269,7 +269,7 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
         ShimTypeInfo type = new(
             key,
             declaration,
-            QualifiedName(declaration),
+            RecordCppName(declaration.Type),
             ShimOptions.ExportPrefix + "_" + ToIdentifier(QualifiedName(declaration).Replace("::", "_", StringComparison.Ordinal)),
             CandidateHandleName(declaration),
             RecordKeyword(declaration.kind))
@@ -794,6 +794,11 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
         if (IsNonBindableFreeFunction(declaration, name))
             return;
 
+        // C++ 运算符作为自由函数同样无法在 C 侧表达（Qt 的 QArrayData 命名空间下有大量 operator+/-），
+        // 且部分重载已被删除（C2280）
+        if (name.StartsWith("operator", StringComparison.Ordinal))
+            return;
+
         if (IsSupportedReturn(declaration.ResultType) is false)
             return;
 
@@ -1164,6 +1169,28 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
         }
     }
 
+    /// <summary>
+    /// 标量类型对应的 C 文本；用户自定义类型返回 <c>null</c>（拼不出合法 C 指针）。
+    /// </summary>
+    /// <remarks>
+    /// 与 <see cref="ScalarCType"/> 的区别：记录/枚举/函数原型等非标量一律返回 <c>null</c>，
+    /// 用于判断「能不能作为 T 出现在 C 侧指针里」。
+    /// </remarks>
+    private string? ScalarCTypeOrNull(CXType type)
+        => Canonical(type).kind switch
+        {
+            CXTypeKind.CXType_Char_S or CXTypeKind.CXType_Char_U
+                or CXTypeKind.CXType_SChar or CXTypeKind.CXType_UChar
+                or CXTypeKind.CXType_Short or CXTypeKind.CXType_UShort
+                or CXTypeKind.CXType_Int or CXTypeKind.CXType_UInt
+                or CXTypeKind.CXType_Long or CXTypeKind.CXType_ULong
+                or CXTypeKind.CXType_LongLong or CXTypeKind.CXType_ULongLong
+                or CXTypeKind.CXType_Float or CXTypeKind.CXType_Double
+                or CXTypeKind.CXType_Bool
+                => ScalarCType(Canonical(type)),
+            _ => null,
+        };
+
     protected virtual string? ScalarCType(CXType canonical)
         => canonical.kind switch
         {
@@ -1171,6 +1198,9 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
             CXTypeKind.CXType_Bool => "bool",
             // char 在 C 侧用 char，便于与 UTF-8 字符串 marshaller 对应
             CXTypeKind.CXType_Char_S or CXTypeKind.CXType_Char_U => "char",
+            // Qt 的 QChar::unicode() 返回 char16_t，必须映射成定宽整型，否则返回位会退化成 void（C2562）
+            CXTypeKind.CXType_Char16 => "uint16_t",
+            CXTypeKind.CXType_Char32 => "uint32_t",
             CXTypeKind.CXType_SChar => "int8_t",
             CXTypeKind.CXType_UChar => "uint8_t",
             CXTypeKind.CXType_UShort => "uint16_t",
@@ -1217,6 +1247,11 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
         if (result.kind is CXTypeKind.CXType_Enum)
             return "int32_t";
 
+        // 标量必须在指针分支之前返回：否则形如 char16_t/ushort 的值返回会多拼一层 `*`
+        // （QChar::unicode 曾因此生成 uint16_t*，C2440）
+        if (ScalarCType(result) is { } scalarType)
+            return scalarType;
+
         if (result.kind is CXTypeKind.CXType_Pointer
             or CXTypeKind.CXType_LValueReference
             or CXTypeKind.CXType_RValueReference)
@@ -1224,21 +1259,42 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
             return ParameterCType(result, indirect: false);
         }
 
-        return ScalarCType(result) ?? handleFallback;
+        return handleFallback;
     }
 
     /// <summary>
-    /// 返回值是否属于「按值返回、且无法安全桥接到 C」的记录类型。
+    /// 返回值是否属于「无法安全桥接到 C」的记录类型（按值或以引用返回）。
     /// </summary>
     /// <remarks>
-    /// shim 对记录类型一律用不透明句柄指针表达，而按值返回时 C++ 侧 <c>return</c> 的是对象本身，
-    /// 塞进 <c>cpp_shim_X*</c> 返回位会直接报 C2440（Qt Core 实测 100 条：QPropertyBindingError、
-    /// QMetaType、QBindable&lt;T&gt;、各容器 const_iterator 等）。C 侧既没有这些类型的完整定义，
-    /// 也无法安全地把它当成句柄长期持有，因此**按值返回的记录类型一律不生成导出**。
-    /// 引用/指针返回不受影响（它们本来就是句柄语义）。
+    /// shim 对记录类型一律用不透明句柄指针表达，而 C++ 侧 <c>return</c> 的是对象本身或引用，
+    /// 塞进 <c>cpp_shim_X*</c> / <c>void*</c> 返回位都会报 C2440。
+    /// C 侧既没有这些类型的完整定义，也无法安全地把它当成句柄长期持有，因此一律不生成导出。
+    /// 必须**剥开引用**再看内层类型：Qt 常常 <c>QByteArray&amp;</c>、<c>QAnyStringView&amp;</c> 这样按引用返回，
+    /// canonical kind 会是 <c>LValueReference</c> 而不是 <c>Record</c>，只判 Record 会全部漏网。
+    /// 指针返回不受影响（它本来就是句柄语义）。
     /// </remarks>
     private static bool IsUnbindableValueReturn(CXType resultType)
-        => Canonical(resultType).kind is CXTypeKind.CXType_Record;
+    {
+        CXType shape = PeelReference(Canonical(resultType));
+        return shape.kind is CXTypeKind.CXType_Record;
+    }
+
+    /// <summary>
+    /// 剥掉引用限定（引用指向的目标类型）。
+    /// </summary>
+    private static CXType PeelReference(CXType type)
+    {
+        CXType current = type;
+        for (int guard = 0; guard < 8; guard++)
+        {
+            if (current.kind is not (CXTypeKind.CXType_LValueReference or CXTypeKind.CXType_RValueReference))
+                return current;
+
+            current = Canonical(current.PointeeType);
+        }
+
+        return current;
+    }
 
     /// <summary>
     /// 名称表明是迭代器/哨兵/私有信号之类的「依附型」类型。
@@ -1809,15 +1865,16 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
     /// </summary>
     /// <remarks>
     /// 覆盖三类实测问题：
-    /// ① C++ 返回记录/类类型，C 侧却被映射成 <c>void*</c> 或其它指针（<c>QByteArray → void*</c>、
-    ///    <c>const void* → void*</c>）；
+    /// ① C++ 返回记录/类类型（含按**引用**返回），C 侧却被映射成 <c>void*</c> 或其它指针
+    ///    （<c>QByteArray&amp; → void*</c>、<c>QAnyStringView&amp; → void*</c>、<c>const void* → void*</c>）；
     /// ② C++ 返回标量，C 侧被映射成指针（<c>char → char*</c>）；
     /// ③ C++ 返回值带 <c>const</c> 限定而 C 侧去掉了限定（<c>const char* → char*</c>）。
     /// 枚举按 <c>static_cast</c> 处理，属于已知可转换的组合，不在此列。
     /// </remarks>
     private bool IsInconsistentReturn(CXType resultType, string returnCType)
     {
-        CXType result = Canonical(resultType);
+        // 引用必须先剥开：Qt 大量按 QByteArray& / QAnyStringView& 返回，只判 canonical 会全部漏网
+        CXType result = PeelReference(Canonical(resultType));
         if (result.kind is CXTypeKind.CXType_Enum or CXTypeKind.CXType_Void)
             return false;
 
@@ -1856,18 +1913,18 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
 
                     CXType pointee = Canonical(result.PointeeType);
                     bool cppConst = pointee.IsConstQualified;
-                    if (cppConst && cIsVoidPointer)
+
+                    // const T* 不能喂给 T*：C 层必须保留 const 限定（Qt 的 constData()/const_iterator 大量踩中）
+                    if (pointee.IsConstQualified && returnCType.StartsWith("const ", StringComparison.Ordinal) is false)
                         return true;
 
-                    // const T* 不能喂给 T*
-                    string cppPointee = CppTypeOf(pointee);
-                    if (cppConst && returnCType is not "void*"
-                        && returnCType.StartsWith("const ", StringComparison.Ordinal) is false
-                        && cppPointee.StartsWith("const ", StringComparison.Ordinal) is false
-                        && cppPointee is not "char")
-                    {
+                    // T* 的 T 必须是能桥接成 C 标量的类型；用户自定义类型（迭代器、嵌套常量等）拼不出合法 C 指针
+                    if (ScalarCTypeOrNull(pointee) is null && pointee.kind is not CXTypeKind.CXType_Void)
                         return true;
-                    }
+
+                    // const 目标类型喂给 void* 同样会丢掉限定
+                    if (cppConst && cIsVoidPointer)
+                        return true;
 
                     return false;
                 }
@@ -2199,3 +2256,7 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
         public string ToCppExpression { get; } = toCppExpression;
     }
 }
+
+
+
+
