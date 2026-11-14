@@ -433,9 +433,20 @@ public sealed partial class QTShimGenerator(QTShimGeneratorOptions options) : Cp
             }
         }
 
-        // 2) 在链接块内、函数声明之前插入连接句柄与回调 typedef
-        string anchor = "\r\n#if defined(__cplusplus)\r\nextern \"C\" {\r\n#endif\r\n";
+        // 2) 必须插在基类的句柄前置声明块之后：回调 typedef 的形参里会用到
+        //    cpp_shim_*_QPrivateSignal、cpp_shim_QSocketDescriptor 等句柄，
+        //    若早于前置声明，在 extern "C" 下会被编译器当作未知类型（MSVC C2061）。
+        string anchor = "\r\nCPP_SHIM_EXPORT ";
         int anchorIndex = header.IndexOf(anchor, StringComparison.Ordinal);
+        if (anchorIndex < 0)
+        {
+            // 没有任何导出函数时也要能插入，退回到链接块收尾位置（插在右花括号之前）
+            anchor = "\r\n#ifdef __cplusplus\r\n}";
+            anchorIndex = header.IndexOf(anchor, StringComparison.Ordinal);
+            if (anchorIndex >= 0)
+                anchorIndex += "\r\n#ifdef __cplusplus".Length;
+        }
+
         if (anchorIndex < 0)
             return header;
 
@@ -457,8 +468,7 @@ public sealed partial class QTShimGenerator(QTShimGeneratorOptions options) : Cp
         block.Write(';');
         block.WriteLine();
 
-        int insertAt = anchorIndex + anchor.Length;
-        header = header.Insert(insertAt, block.ToString());
+        header = header.Insert(anchorIndex, block.ToString());
         return header;
     }
 
