@@ -1173,23 +1173,19 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
     /// 标量类型对应的 C 文本；用户自定义类型返回 <c>null</c>（拼不出合法 C 指针）。
     /// </summary>
     /// <remarks>
-    /// 与 <see cref="ScalarCType"/> 的区别：记录/枚举/函数原型等非标量一律返回 <c>null</c>，
-    /// 用于判断「能不能作为 T 出现在 C 侧指针里」。
+    /// 以 <see cref="ScalarCType"/> 为唯一事实来源，避免「支持哪些标量」出现两份互不一致的白名单——
+    /// <c>char16_t</c>/<c>char32_t</c> 曾只在 <see cref="ScalarCType"/> 里列过，
+    /// 导致 <c>QChar::unicode</c> 被当成非标量、返回位多拼一层指针（C2440）。
+    /// 仅额外排除 <c>void</c>（它不是可以作为返回值的标量）。
     /// </remarks>
     private string? ScalarCTypeOrNull(CXType type)
-        => Canonical(type).kind switch
-        {
-            CXTypeKind.CXType_Char_S or CXTypeKind.CXType_Char_U
-                or CXTypeKind.CXType_SChar or CXTypeKind.CXType_UChar
-                or CXTypeKind.CXType_Short or CXTypeKind.CXType_UShort
-                or CXTypeKind.CXType_Int or CXTypeKind.CXType_UInt
-                or CXTypeKind.CXType_Long or CXTypeKind.CXType_ULong
-                or CXTypeKind.CXType_LongLong or CXTypeKind.CXType_ULongLong
-                or CXTypeKind.CXType_Float or CXTypeKind.CXType_Double
-                or CXTypeKind.CXType_Bool
-                => ScalarCType(Canonical(type)),
-            _ => null,
-        };
+    {
+        CXType canonical = Canonical(type);
+        if (canonical.kind is CXTypeKind.CXType_Void)
+            return null;
+
+        return ScalarCType(canonical);
+    }
 
     protected virtual string? ScalarCType(CXType canonical)
         => canonical.kind switch
@@ -1214,19 +1210,29 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
             _ => null,
         };
 
+    /// <summary>
+    /// 返回值能否桥接到 C。
+    /// </summary>
+    /// <remarks>
+    /// 同样以 <see cref="ScalarCType"/> 为唯一事实来源，避免白名单遗漏：
+    /// 任何能映射出标量 C 类型的原生类型都算支持，另外再放行指针、引用、记录、枚举。
+    /// 之前这里单独列了一份标量清单，就漏掉了 <c>char16_t</c>/<c>char32_t</c>。
+    /// </remarks>
     protected virtual bool IsSupportedReturn(CXType type)
-        => Canonical(type).kind is CXTypeKind.CXType_Void
+    {
+        CXType canonical = Canonical(type);
+        if (canonical.kind is CXTypeKind.CXType_Void
             or CXTypeKind.CXType_Pointer
             or CXTypeKind.CXType_LValueReference
             or CXTypeKind.CXType_RValueReference
             or CXTypeKind.CXType_Record
-            or CXTypeKind.CXType_Enum
-            or CXTypeKind.CXType_Bool
-            or CXTypeKind.CXType_Char_S or CXTypeKind.CXType_Char_U or CXTypeKind.CXType_SChar
-            or CXTypeKind.CXType_UChar or CXTypeKind.CXType_Short or CXTypeKind.CXType_UShort
-            or CXTypeKind.CXType_Int or CXTypeKind.CXType_UInt or CXTypeKind.CXType_Long
-            or CXTypeKind.CXType_ULong or CXTypeKind.CXType_LongLong or CXTypeKind.CXType_ULongLong
-            or CXTypeKind.CXType_Float or CXTypeKind.CXType_Double;
+            or CXTypeKind.CXType_Enum)
+        {
+            return true;
+        }
+
+        return ScalarCTypeOrNull(canonical) is not null;
+    }
 
     /// <summary>
     /// 返回值的 C 类型文本；记录类型返回对应句柄指针，无法表达时返回 null。
@@ -1887,10 +1893,14 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
             case CXTypeKind.CXType_Record:
                 return true;
 
-            // 标量不可能"是指针"；映射出指针说明类型映射本身错了
+            // 标量不可能"是指针"；映射出指针说明类型映射本身错了。
+            // 这里按「能否映射出标量 C 类型」判断，而不是逐个枚举 kind，
+            // 避免以后新增标量类型（如 char16_t）时又要同步修改多份清单
             case CXTypeKind.CXType_Bool
                 or CXTypeKind.CXType_Char_S
                 or CXTypeKind.CXType_Char_U
+                or CXTypeKind.CXType_Char16
+                or CXTypeKind.CXType_Char32
                 or CXTypeKind.CXType_SChar
                 or CXTypeKind.CXType_UChar
                 or CXTypeKind.CXType_Short
@@ -2256,7 +2266,3 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
         public string ToCppExpression { get; } = toCppExpression;
     }
 }
-
-
-
-
