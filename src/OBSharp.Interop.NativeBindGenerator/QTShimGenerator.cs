@@ -89,6 +89,18 @@ public sealed partial class QTShimGenerator(QTShimGeneratorOptions options) : Cp
             && member.Spelling.ToString().StartsWith("operator", StringComparison.Ordinal);
 
     /// <summary>
+    /// 成员函数地址能否从 shim 里取用（<c>&amp;Class::member</c>）。
+    /// </summary>
+    /// <remarks>
+    /// <c>signals:</c> 在 clang 里算 protected 区，但 Qt 的公开信号本来就需要能被连接，
+    /// 因此这里只排除**明确声明为 private/protected 的成员**；
+    /// Qt 的 protected slot（如 <c>resetInternalData</c>）会因此被正确跳过。
+    /// </remarks>
+    private static bool IsMemberAddressable(CXCursor member)
+        => member.CXXAccessSpecifier is CX_CXXAccessSpecifier.CX_CXXInvalidAccessSpecifier
+            or CX_CXXAccessSpecifier.CX_CXXPublic;
+
+    /// <summary>
     /// <c>QString</c> 在 C 侧表现为 <c>char</c>，与 .NET 的 UTF-8 marshaller 对应。
     /// </summary>
     protected override string? ScalarCType(CXType canonical)
@@ -109,8 +121,25 @@ public sealed partial class QTShimGenerator(QTShimGeneratorOptions options) : Cp
     /// <summary>
     /// 返回 <c>QString</c> 的函数在 C 侧返回 <c>const char*</c>（借用，托管侧只复制不释放）。
     /// </summary>
+    /// <remarks>
+    /// 只对**按值返回**的 <c>QString</c> 生效。若是 <c>QString*</c> / <c>QString&amp;</c> 返回，
+    /// 走基类路径（按句柄/引用语义处理），否则会生成 <c>return QString*</c> 到 <c>const char*</c> 的
+    /// 不可编译转换（C2440）。
+    /// </remarks>
     protected override string? ReturnCType(CXType resultType, string? handleFallback)
-        => IsQString(Canonical(resultType)) ? "const char*" : base.ReturnCType(resultType, handleFallback);
+        => IsQStringValueReturn(resultType) ? "const char*" : base.ReturnCType(resultType, handleFallback);
+
+    /// <summary>
+    /// 返回值是否为**按值**的 <c>QString</c>（剥掉 typedef/elaborated 后仍是记录类型本身）。
+    /// </summary>
+    private static bool IsQStringValueReturn(CXType resultType)
+    {
+        CXType shape = Canonical(resultType);
+        if (shape.kind is not CXTypeKind.CXType_Record)
+            return false;
+
+        return IsQString(shape);
+    }
 
     /// <summary>
     /// <c>QString</c> 参数的重载后缀用 <c>s</c>。
@@ -195,6 +224,11 @@ public sealed partial class QTShimGenerator(QTShimGeneratorOptions options) : Cp
         {
             CXCursor method = definition.GetMethod((uint)i);
             if (IsSignal(method) is false || method.IsImplicit || method.CXXMethod_IsStatic)
+                continue;
+
+            // 连接导出会生成 `&Class::member` 取成员函数地址：非 public 的成员在此处不可访问
+            // （Qt 的 resetInternalData 是 protected slot，取地址会报 C2248）
+            if (IsMemberAddressable(method) is false)
                 continue;
 
             AppendSignalConnect(type, method);

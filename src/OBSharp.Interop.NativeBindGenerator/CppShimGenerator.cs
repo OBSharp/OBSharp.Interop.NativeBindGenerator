@@ -591,13 +591,43 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
     /// 还要求存在可调用的默认构造。<c>QAdoptSharedDataTag</c> 只声明了带参构造、
     /// <c>QAbstractConcatenable</c> 只有删除的拷贝构造，二者都不能 <c>new X()</c>（C2514/C2641）。
     /// </remarks>
-    private static bool CanConstructDefault(CXCursor definition)
+    /// <remarks>
+    /// 除自身可默认构造外，还必须保证**基类链上每一层的默认构造都可达**：
+    /// <c>QOperatingSystemVersionUnexported</c> 自己没声明构造，但其隐式默认构造会调用
+    /// <c>QOperatingSystemVersionBase</c> 的 protected 默认构造，从外部 <c>new</c> 一样报 C2248。
+    /// </remarks>
+    private static bool CanConstructDefault(CXCursor definition, int depth = 0)
     {
+        if (depth > 8)
+            return false;
+
         // libclang 对「声明了任何构造函数」的类型不一定给出 NumCtors>0（模板里/被删除的情况尤其如此），
         // 因此统一按「有可调用的无参构造 + 字段可默认构造」判定；
         // 完全没有任何构造的类型由 HasDefaultConstructorOverload 的 count==0 分支放行（隐式默认构造）
-        return HasDefaultConstructorOverload(definition)
-            && HasUsableDefaultConstructor(definition);
+        if (HasDefaultConstructorOverload(definition) is false
+            || HasUsableDefaultConstructor(definition) is false)
+        {
+            return false;
+        }
+
+        // 基类的默认构造必须同样可达，否则派生类的隐式默认构造会在内部调用不可访问的基类构造
+        int baseCount = definition.NumBases;
+        for (int i = 0; i < baseCount; i++)
+        {
+            CXType baseType = Canonical(definition.GetBase((uint)i).Type);
+            if (baseType.kind is not CXTypeKind.CXType_Record)
+                continue;
+
+            CXCursor baseDeclaration = baseType.Declaration;
+            CXCursor baseDefinition = baseDeclaration.IsNull ? default : baseDeclaration.Definition;
+            if (baseDefinition.IsNull)
+                return false;
+
+            if (CanConstructDefault(baseDefinition, depth + 1) is false)
+                return false;
+        }
+
+        return true;
     }
 
     /// <summary>
@@ -1101,6 +1131,71 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
     }
 
     /// <summary>
+    /// 类型对调用方是否可见：沿 typedef/指针/引用剥壳，并递归检查记录声明及其模板实参。
+    /// </summary>
+    /// <remarks>
+    /// 可见性问题会经三条**间接路径**进入产物，只查「登记的类型」远远不够：
+    /// ① 模板实参含不可见类型（<c>QTaggedPointer&lt;_, QLibrary::LoadStatusTag&gt;</c>，LoadStatusTag 是 private enum）；
+    /// ② 成员签名里直接出现的不可见嵌套类（<c>QList&lt;QObject*&gt;::DisableRValueRefs</c>）；
+    /// ③ 上面两类经 typedef 间接引用。任一命中都应在 C++ 侧触发 C2248，因此必须在拼写入口统一拦截。
+    /// </remarks>
+    private static bool IsTypeVisible(CXType type, int depth = 0)
+    {
+        if (depth > 8)
+            return false;
+
+        CXType shape = Canonical(type);
+        switch (shape.kind)
+        {
+            case CXTypeKind.CXType_Pointer:
+            case CXTypeKind.CXType_LValueReference:
+            case CXTypeKind.CXType_RValueReference:
+            case CXTypeKind.CXType_ConstantArray:
+            case CXTypeKind.CXType_IncompleteArray:
+                return IsTypeVisible(shape.PointeeType, depth + 1)
+                    || IsTypeVisible(shape.ArrayElementType, depth + 1);
+
+            case CXTypeKind.CXType_Record:
+                {
+                    CXCursor declaration = shape.Declaration;
+                    if (declaration.IsNull)
+                        return true;
+
+                    if (IsTypeVisibleAtCursor(declaration) is false)
+                        return false;
+
+                    // 模板实参同样可能含不可见类型（private enum 等），必须递归检查
+                    int argumentCount = shape.NumTemplateArguments;
+                    for (int i = 0; i < argumentCount; i++)
+                    {
+                        CXType argument = shape.GetTemplateArgument((uint)i).AsType;
+                        if (argument.kind is CXTypeKind.CXType_Invalid)
+                            continue;
+
+                        if (IsTypeVisible(argument, depth + 1) is false)
+                            return false;
+                    }
+
+                    return true;
+                }
+
+            default:
+                return true;
+        }
+    }
+
+    /// <summary>
+    /// 声明本身对调用方是否可见（命名空间作用域或 public 区）。
+    /// </summary>
+    /// <remarks>
+    /// <see cref="IsTypeVisible"/> 是纯静态判定，无法访问派生类的 <see cref="IsVisibleToCaller"/> 覆盖，
+    /// 因此这里给出等价的基础判定；框架特化若需要更严格的规则，应同步该方法。
+    /// </remarks>
+    private static bool IsTypeVisibleAtCursor(CXCursor declaration)
+        => declaration.CXXAccessSpecifier is CX_CXXAccessSpecifier.CX_CXXInvalidAccessSpecifier
+            or CX_CXXAccessSpecifier.CX_CXXPublic;
+
+    /// <summary>
     /// 目标类型的 <c>const</c> 限定前缀。
     /// </summary>
     private static string QualifierPrefix(CXType type)
@@ -1154,6 +1249,11 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
     /// </summary>
     protected virtual string? ParameterCType(CXType canonical, bool indirect)
     {
+        // 签名里出现不可见类型（private/protected 嵌套类、含不可见实参的模板实例）时降级为 void*，
+        // 否则 C++ 侧引用该名字会直接报 C2248（QList<QObject*>::DisableRValueRefs 这类）
+        if (Canonical(canonical).kind is CXTypeKind.CXType_Record && IsTypeVisible(canonical) is false)
+            return indirect ? "void**" : "void*";
+
         switch (canonical.kind)
         {
             case CXTypeKind.CXType_Pointer:
@@ -2379,3 +2479,4 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
         public string ToCppExpression { get; } = toCppExpression;
     }
 }
+
