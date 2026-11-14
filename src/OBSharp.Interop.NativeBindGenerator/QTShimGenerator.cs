@@ -265,7 +265,10 @@ public sealed partial class QTShimGenerator(QTShimGeneratorOptions options) : Cp
     private void AppendSignalConnect(ShimTypeInfo type, CXCursor signal)
     {
         string signalName = signal.Spelling.ToString();
-        string snake = signalName.Underscore();
+
+        // 标识符必须合法：`operator=` 里含 `=`，Underscore() 不会剔除它，
+        // 直接拼进符号名会生成 `cpp_shim_X_connect_operator=(...)` 这种非法 C 标识符
+        string snake = ToIdentifier(SignalIdentifier(signalName));
 
         List<ShimParameterInfo> parameters = [];
         List<string> cppTypes = [];
@@ -304,6 +307,47 @@ public sealed partial class QTShimGenerator(QTShimGeneratorOptions options) : Cp
             connectionType + "*",
             parametersDeclaration,
             body);
+    }
+
+    /// <summary>
+    /// 信号名到符号名用的基础形式：C++ 运算符名先做可读化替换，避免运算符字符进入标识符。
+    /// </summary>
+    /// <remarks>
+    /// <c>operator=</c>、<c>operator==</c>、<c>operator!=</c>、<c>operator&lt;&lt;</c> 等经
+    /// <c>Underscore()</c> 后仍会保留 <c>=</c>、<c>&lt;</c>、<c>!</c> 等字符，因此先映射成
+    /// 语义等价的可读后缀，再交给 <see cref="CppShimGenerator.ToIdentifier"/> 做最终净化。
+    /// </remarks>
+    private static string SignalIdentifier(string name)
+    {
+        if (name.StartsWith("operator", StringComparison.Ordinal) is false)
+            return name;
+
+        string operation = name["operator".Length..].Trim();
+        string suffix = operation switch
+        {
+            "=" => "assign",
+            "==" => "eq",
+            "!=" => "ne",
+            "<" => "lt",
+            "<=" => "le",
+            ">" => "gt",
+            ">=" => "ge",
+            "<<" => "ls",   // left shift
+            ">>" => "rs",   // right shift
+            "+" => "add",
+            "-" => "sub",
+            "*" => "mul",
+            "/" => "div",
+            "%" => "mod",
+            "[]" => "index",
+            "()" => "call",
+            "+=" => "addassign",
+            "-=" => "subassign",
+            "" => "operator",
+            _ => "op",
+        };
+
+        return "operator_" + suffix;
     }
 
     /// <summary>

@@ -262,6 +262,11 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
         if (IsUninstantiatedTemplate(declaration))
             return;
 
+        // 类型对调用方不可见时（private/protected 嵌套 struct/enum，或其模板实参不可见）不登记：
+        // 否则会生成 `new QList<QInputMethodQueryEvent::QueryPair>(size)` 这类在 C++ 侧无法访问的名字
+        if (IsTypeVisible(declaration.Type) is false)
+            return;
+
         uint key = KeyOf(declaration);
         if (TypeByKey.ContainsKey(key))
             return;
@@ -882,10 +887,53 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
         if (IsQtUtilityName(name))
             return true;
 
-        // CRT / 编译器运行时：(__ 开头的所有保留名，例如 __report_gsfailure、__security_*、__CxxThrowException
-        return name.StartsWith("__", StringComparison.Ordinal)
-            || (name.StartsWith('_') && LooksLikeCrtReservedName(name));
+        // CRT / 编译器运行时：__ 开头的所有保留名（例如 __report_gsfailure、__security_*、__CxxThrowException）
+        if (name.StartsWith("__", StringComparison.Ordinal))
+            return true;
+
+        // 单下划线 + 来自编译器/SDK 系统头：_stui、_xend、_xbegin、_wbnoinvd 等内建指令函数。
+        // 不按名字逐个枚举（B3 的教训），改为判断声明所在文件是否位于系统头路径——
+        // Qt 头才是一等公民，其余系统头里的自由函数一律不导出
+        return name.StartsWith('_') && IsSystemHeaderDeclaration(declaration);
     }
+
+    /// <summary>
+    /// 声明是否位于编译器/系统 SDK 的头文件（非用户/框架头）。
+    /// </summary>
+    /// <remarks>
+    /// 判据用路径特征而非文件名清单：<c>VC\Tools\MSVC\...\include</c>、<c>include/msvc</c>、
+    /// <c>/usr/include</c>、<c>/usr/lib/&lt;triple&gt;/include</c>、<c>Windows Kits</c> 等。
+    /// 只要声明来自这些根，就不把它的自由函数当作可绑定接口。
+    /// </remarks>
+    private static bool IsSystemHeaderDeclaration(CXCursor declaration)
+    {
+        declaration.Location.GetExpansionLocation(out CXFile file, out _, out _, out _);
+        string path = file.Name.ToString().Replace('\\', '/');
+        if (path.Length is 0)
+            return false;
+
+        foreach (string marker in SystemHeaderMarkers)
+        {
+            if (path.Contains(marker, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// 系统/编译器头文件的路径特征。
+    /// </summary>
+    private static readonly string[] SystemHeaderMarkers =
+    [
+        "/VC/Tools/MSVC/",
+        "/Windows Kits/",
+        "/include/msvc/",
+        "/usr/include/",
+        "/usr/lib/",
+        "/Library/Developer/",
+        "/opt/homebrew/",
+    ];
 
     /// <summary>
     /// Qt 工具函数名：<c>q</c> 前缀的宏/内联函数族与 <c>qt_</c> 内部命名空间族。
@@ -1124,15 +1172,44 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
     /// <c>QualifiedName</c> 只沿语义父级拼名字，模板实例会退化成裸模板名
     /// （<c>QFlags</c>、<c>std::chrono::duration</c>），在 C++ 侧直接报 C2955。
     /// 因此优先采用 libclang 给的完整拼写；只有在拼写缺失时才回退到限定名。
+    /// **拼写里可能已经带 <c>const</c> 限定**（libclang 的 <c>Type.Spelling</c> 含限定符），
+    /// 因此这里剥离掉前导 <c>const</c>/<c>volatile</c>，限定符统一由调用方
+    /// （<see cref="QualifierPrefix"/>）决定，避免输出 <c>const const T</c>（duplicate 'const'）。
     /// </remarks>
     private static string RecordCppName(CXType type)
     {
         string spelling = type.Spelling.ToString();
         if (spelling.Length is not 0)
-            return spelling;
+            return StripQualifiers(spelling);
 
         CXCursor declaration = type.Declaration;
         return declaration.IsNull ? "void" : QualifiedName(declaration);
+    }
+
+    /// <summary>
+    /// 去掉类型拼写开头的 <c>const</c> / <c>volatile</c> 限定词。
+    /// </summary>
+    /// <remarks>
+    /// 只处理前缀，不碰实参列表里的限定（<c>const T*</c> 指针目标在实参里是合法且有意义的）。
+    /// </remarks>
+    private static string StripQualifiers(string spelling)
+    {
+        string current = spelling.TrimStart();
+        bool stripped = true;
+        while (stripped)
+        {
+            stripped = false;
+            foreach (string qualifier in (string[])["const ", "volatile "])
+            {
+                if (current.StartsWith(qualifier, StringComparison.Ordinal) is false)
+                    continue;
+
+                current = current[qualifier.Length..].TrimStart();
+                stripped = true;
+            }
+        }
+
+        return current;
     }
 
     /// <summary>
@@ -1808,6 +1885,112 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
     private static partial Regex VoidParameterRegex { get; }
 
     /// <summary>
+    /// 写出前自检：不得出现重复的 <c>const</c> 限定（duplicate 'const'）。
+    /// </summary>
+    /// <remarks>
+    /// 成因是「libclang 拼写自带 const」与「调用方再加 const」两处叠加。
+    /// 后者多出现在指针目标或引用目标上，因此检查 <c>const const</c> 与 <c>const * const</c> 两种相邻形态。
+    /// </remarks>
+    private static void AssertNoDuplicateConst(IEnumerable<GeneratedFile> files)
+    {
+        foreach (GeneratedFile file in files)
+        {
+            if (file.Name.EndsWith(".cpp", StringComparison.Ordinal) is false)
+                continue;
+
+            if (DuplicateConstRegex.IsMatch(file.Content))
+            {
+                throw new InvalidOperationException(
+                    "生成的 shim 中出现了重复的 const 限定（duplicate 'const'）：" + file.Name);
+            }
+        }
+    }
+
+    /// <summary>
+    /// 重复 <c>const</c>：<c>const const</c>，或 <c>const * const</c> / <c>const* const</c>。
+    /// </summary>
+    [GeneratedRegex(@"const\s+const|const\s*\*\s*const", RegexOptions.Compiled | RegexOptions.CultureInvariant)]
+    private static partial Regex DuplicateConstRegex { get; }
+
+    /// <summary>
+    /// 写出前自检：生成产物里出现的 C 标识符必须匹配 <c>^[A-Za-z_][A-Za-z0-9_]*$</c>。
+    /// </summary>
+    /// <remarks>
+    /// 这是「一次兜住所有未来非法命名」的通用断言：<c>operator=</c> 的 <c>=</c> 曾被直接拼进
+    /// <c>cpp_shim_X_connect_operator=(...)</c>，MSVC/GCC 都报语法错误。
+    /// 只检查本生成器产出的两类名字：<c>CPP_SHIM_CALL</c> 之后的符号名，与 <c>typedef</c> 里的回调类型名。
+    /// </remarks>
+    private static void AssertIdentifierSyntax(IEnumerable<GeneratedFile> files)
+    {
+        List<string> offenders = [];
+        foreach (GeneratedFile file in files)
+        {
+            foreach (Match match in EmittedSymbolRegex.Matches(file.Content))
+            {
+                string symbol = match.Groups["symbol"].Value;
+                if (IsValidIdentifier(symbol) is false && offenders.Contains(symbol, StringComparer.Ordinal) is false)
+                    offenders.Add(symbol);
+            }
+
+            foreach (Match match in EmittedTypedefRegex.Matches(file.Content))
+            {
+                string name = match.Groups["name"].Value;
+                if (IsValidIdentifier(name) is false && offenders.Contains(name, StringComparer.Ordinal) is false)
+                    offenders.Add(name);
+            }
+        }
+
+        if (offenders.Count is 0)
+            return;
+
+        offenders.Sort(StringComparer.Ordinal);
+        throw new InvalidOperationException(
+            "生成的 shim 中出现了非法的 C 标识符：" + string.Join(", ", offenders));
+    }
+
+    /// <summary>
+    /// 标识符是否只含字母、数字与下划线，且不以数字开头。
+    /// </summary>
+    private static bool IsValidIdentifier(string name)
+    {
+        if (name.Length is 0)
+            return false;
+
+        if (name[0] is not ('_' or (>= 'A' and <= 'Z') or (>= 'a' and <= 'z')))
+            return false;
+
+        foreach (char character in name)
+        {
+            if (character is '_' or (>= 'A' and <= 'Z') or (>= 'a' and <= 'z') or (>= '0' and <= '9'))
+                continue;
+
+            return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// 函数定义/声明里 <c>CPP_SHIM_CALL</c> 之后的符号名。
+    /// </summary>
+    /// <remarks>
+    /// 纯函数名形态（<c>CPP_SHIM_CALL 名字(...)</c>）。函数指针上下文里的 <c>*名字</c>
+    /// 由 <see cref="EmittedTypedefRegex"/> 单独处理，这里用 <c>[^\s(*]+</c> 排除 <c>*</c>，
+    /// 避免把 <c>*名字)</c> 当成非法标识符误报。
+    /// </remarks>
+    [GeneratedRegex(@"CPP_SHIM_CALL\s+(?<symbol>[^\s(\)\*]+)\s*\(", RegexOptions.Compiled | RegexOptions.CultureInvariant)]
+    private static partial Regex EmittedSymbolRegex { get; }
+
+    /// <summary>
+    /// 回调 typedef 里被声明的类型名（<c>typedef void (CPP_SHIM_CALL *名字)(...)</c>）。
+    /// </summary>
+    /// <remarks>
+    /// 名字前有 <c>*</c>（函数指针），必须把它排除在捕获组之外，否则会把 <c>*名字</c> 当成非法标识符误报。
+    /// </remarks>
+    [GeneratedRegex(@"typedef\s+void\s*\(\s*CPP_SHIM_CALL\s*(?:\*\s*)?(?<name>[A-Za-z_][A-Za-z0-9_]*)\s*\)", RegexOptions.Compiled | RegexOptions.CultureInvariant)]
+    private static partial Regex EmittedTypedefRegex { get; }
+
+    /// <summary>
     /// 对 <c>void*</c> 结果的解引用：<c>*reinterpret_cast&lt;void*&gt;(...)</c>。
     /// </summary>
     [GeneratedRegex(@"\*\s*reinterpret_cast<void\s*\*>", RegexOptions.Compiled | RegexOptions.CultureInvariant)]
@@ -1929,6 +2112,12 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
 
         // 写出前断言：不得出现 void 形参（C2860）或对 void* 的解引用（C2100）
         AssertNoVoidMisuse(Files);
+
+        // 写出前断言：不得出现重复 const 限定（duplicate 'const'）
+        AssertNoDuplicateConst(Files);
+
+        // 写出前断言：所有生成的 C 标识符必须合法（一次兜住所有非法字符问题）
+        AssertIdentifierSyntax(Files);
 
         // 写正文，再释放嵌入的转换头文件，最后清理本轮未产出的旧产物
         foreach (GeneratedFile file in Files)
