@@ -18,7 +18,6 @@ public sealed class CBindingGenerator(CBindingGeneratorOptions options) : ClangC
     private readonly Dictionary<uint, string> _nativeSpellings = [];
     private readonly Dictionary<string, string> _typeSources = [with(StringComparer.Ordinal)];
     private readonly Dictionary<uint, string> _createFunctions = [];
-    private readonly Dictionary<uint, int> _createFunctionArity = [];
     private readonly Dictionary<uint, string> _releaseFunctions = [];
     private readonly Dictionary<uint, HostInfo> _handleHosts = [];
     private readonly List<HostInfo> _hosts = [];
@@ -27,6 +26,12 @@ public sealed class CBindingGenerator(CBindingGeneratorOptions options) : ClangC
     private readonly HashSet<string> _usedTypeNames = [with(StringComparer.OrdinalIgnoreCase)];
     private readonly HashSet<string> _functionNames = [with(StringComparer.Ordinal)];
     private readonly HashSet<(string Host, string Name)> _usedMemberNames = [];
+
+    /// <summary>
+    /// 被 <see cref="AllocateMemberName"/> 判定为与 <see cref="System.Runtime.InteropServices.SafeHandle"/> 成员重名、
+    /// 从而追加了下划线后缀的成员，键为宿主类型名与最终成员名。
+    /// </summary>
+    private readonly HashSet<(string Host, string Name)> _renamedHandleMembers = [];
     private readonly List<FunctionInfo> _functions = [];
     private readonly Dictionary<string, string> _libraryBySymbol = [with(StringComparer.Ordinal)];
     private readonly List<ConstantInfo> _constants = [];
@@ -224,10 +229,19 @@ public sealed class CBindingGenerator(CBindingGeneratorOptions options) : ClangC
                 }
 
                 string handleName = EnsureRecordName(declaration);
+
+                // 返回值方向由 .NET 内置的 SafeHandleMarshaller<T>.ManagedToUnmanagedOut 处理：
+                // 该 marshaller 只声明了 ManagedToUnmanagedIn，若给返回值加可空封送会产生 SYSLIB1051
+                if (usage is TypeUsage.Return)
+                    return new(handleName, [], spelling);
+
+                // 包装 API 用 Xxx?，导入声明用 SafeHandle?：marshaler 按 SafeHandle 基类声明，
+                // 若导入签名写 Xxx? 则源生成器找不到匹配的 CustomMarshaller 而报 SYSLIB1051
                 return new(
                     handleName + "?",
                     [$"MarshalUsing(typeof({SafeHandleMarshallerName(handleName)}))"],
-                    spelling);
+                    spelling,
+                    ImportType: "SafeHandle?");
             }
 
             return new(EnsureRecordName(declaration) + "*", [], spelling);
@@ -422,10 +436,13 @@ public sealed class CBindingGenerator(CBindingGeneratorOptions options) : ClangC
             _hostKinds[key] = HostKind.Handle;
             _nativeSpellings[key] = handleNativeName;
             _handleHosts[key] = new(handleName, key, HostKind.Handle, handleNativeName);
+
+            // SafeHandle 骨架成员（含 EmitHandleType 写出的 IsInvalid）与基类成员都属于该宿主，先行登记
+            foreach (string member in SafeHandleMemberNames)
+                _usedMemberNames.Add((handleName, member));
+
             _typeSources[handleName] = EmitHandleType(
                 handleName,
-                EscapeIdentifierOrNull(_createFunctions.GetValueOrDefault(key)),
-                _createFunctionArity.GetValueOrDefault(key, -1),
                 EscapeIdentifierOrNull(_releaseFunctions.GetValueOrDefault(key)));
             return handleName;
         }
@@ -609,7 +626,7 @@ public sealed class CBindingGenerator(CBindingGeneratorOptions options) : ClangC
         return writer.ToString();
     }
 
-    private static string EmitHandleType(string name, string? createFunc, int createArity, string? releaseFunc)
+    private static string EmitHandleType(string name, string? releaseFunc)
     {
         using StringWriter writer = CreateWriter();
         writer.WriteLine("/// <summary>");
@@ -631,18 +648,18 @@ public sealed class CBindingGenerator(CBindingGeneratorOptions options) : ClangC
         writer.WriteLine("    }");
         writer.WriteLine();
 
-        // 只有无参构造函数才能表达成默认构造函数；带参数的由封装层单独暴露
-        if (createFunc is not null && createArity is 0)
-        {
-            writer.Write("    public ");
-            writer.Write(name);
-            writer.Write("() : this(");
-            writer.Write(createFunc);
-            writer.WriteLine("(), true)");
-            writer.WriteLine("    {");
-            writer.WriteLine("    }");
-            writer.WriteLine();
-        }
+        // 必须有一个公开无参构造函数：SafeHandleMarshaller<T>.ManagedToUnmanagedOut 会先调用它、
+        // 再 SetHandle(原生返回值)。因此它只能构造无效句柄，绝不能调用原生 create，
+        // 否则每次返回值封送都会先多创建一个原生对象再被覆盖，造成泄漏。
+        writer.WriteLine("    /// <summary>");
+        writer.WriteLine("    /// 构造一个无效句柄；原生对象需通过静态工厂或带参数的构造函数创建。");
+        writer.WriteLine("    /// </summary>");
+        writer.Write("    public ");
+        writer.Write(name);
+        writer.WriteLine("() : base(0, true)");
+        writer.WriteLine("    {");
+        writer.WriteLine("    }");
+        writer.WriteLine();
 
         writer.WriteLine("    protected override bool ReleaseHandle()");
         writer.WriteLine("    {");
@@ -792,9 +809,7 @@ public sealed class CBindingGenerator(CBindingGeneratorOptions options) : ClangC
             if (LooksLikeCreate(name)
                 && TryGetOpaqueRecord(result, out CXCursor createTarget))
             {
-                uint createKey = KeyOf(createTarget);
-                _createFunctions.TryAdd(createKey, name);
-                _createFunctionArity.TryAdd(createKey, function.NumArguments);
+                _createFunctions.TryAdd(KeyOf(createTarget), name);
             }
         }
     }
@@ -935,10 +950,16 @@ public sealed class CBindingGenerator(CBindingGeneratorOptions options) : ClangC
 
             if (info.IsHandleAssociate)
             {
-                // create 函数无参时已由 SafeHandle 的默认构造函数覆盖；
-                // 带参数时还要生成对应的托管构造函数重载，否则调用方无法按给定参数创建实例
-                if (info.IsCreateAssociate && info.Parameters.Count is not 0)
+                // 无参 create 不能再占用公开无参构造函数（该构造函数必须只构造无效句柄），
+                // 因此改为静态工厂；带参数 create 仍生成对应的托管构造函数重载
+                if (info.IsCreateAssociate)
                 {
+                    if (info.Parameters.Count is 0)
+                    {
+                        info.Host.Members.Add(BuildHandleFactory(info));
+                        continue;
+                    }
+
                     info.MemberName = info.Host.Name;
                     info.Host.Members.Add(BuildHandleConstructor(info));
                 }
@@ -962,13 +983,14 @@ public sealed class CBindingGenerator(CBindingGeneratorOptions options) : ClangC
     /// <summary>
     /// 把已分析的函数转换为封装生成器的输入，并把「指针 + 长度」参数对折叠为 Span 视图。
     /// </summary>
-    private static WrapFunction BuildWrapFunction(FunctionInfo info)
+    private WrapFunction BuildWrapFunction(FunctionInfo info)
     {
         WrapSpanReturn? spanReturn = TryBuildSpanReturn(info);
         return new WrapFunction
         {
             ImportName = info.ImportName,
             MemberName = info.MemberName,
+            CommentLines = MemberComment(info.Host, info.MemberName),
             ReturnType = spanReturn is null
                 ? info.Return.Type
                 : SpanTypeName(spanReturn.ElementType, spanReturn.ReadOnly),
@@ -1005,6 +1027,14 @@ public sealed class CBindingGenerator(CBindingGeneratorOptions options) : ClangC
         string countType = lengthParameter.Mapped.Type.TrimEnd('*');
         return new WrapSpanReturn(elementType, true, "count", countType, "pointer");
     }
+
+    /// <summary>
+    /// 成员重命名时返回说明注释，避免调用方困惑于下划线后缀的来源。
+    /// </summary>
+    private string[] MemberComment(HostInfo host, string memberName)
+        => _renamedHandleMembers.Contains((host.Name, memberName))
+            ? ["/// <summary>", "/// 因与 SafeHandle 成员重名而追加下划线，语义与同名原生成员一致。", "/// </summary>"]
+            : [];
 
     /// <summary>
     /// 识别相邻的「元素指针 + 长度」参数对；元素类型必须是可映射的 blittable 值类型。
@@ -1615,11 +1645,42 @@ public sealed class CBindingGenerator(CBindingGeneratorOptions options) : ClangC
     private string AllocateMemberName(HostInfo host, string candidate)
     {
         string name = EscapeIdentifier(candidate);
+        bool renamed = false;
         while (!_usedMemberNames.Add((host.Name, name)))
+        {
             name += "_";
+            // 句柄宿主上，SafeHandle 的公共成员已被预先登记；撞上它们说明业务成员重名
+            renamed |= host.Kind is HostKind.Handle && SafeHandleMemberNames.Contains(candidate);
+        }
+
+        if (renamed)
+            _renamedHandleMembers.Add((host.Name, name));
 
         return name;
     }
+
+    /// <summary>
+    /// <see cref="System.Runtime.InteropServices.SafeHandle"/> 的公共成员名。
+    /// </summary>
+    /// <remarks>
+    /// 句柄类型是 <c>partial class : SafeHandle</c>，业务方法若与基类成员同名会产生 CS0102 重复定义，
+    /// 因此这些名字在分配成员名时视为已占用，冲突的业务成员统一追加下划线后缀。
+    /// </remarks>
+    private static readonly HashSet<string> SafeHandleMemberNames =
+    [
+        "IsInvalid",
+        "Handle",
+        "Close",
+        "Dispose",
+        "SetHandle",
+        "SetHandleAsInvalid",
+        "ReleaseHandle",
+        "DangerousAddRef",
+        "DangerousRelease",
+        "DangerousGetHandle",
+        "Opened",
+        "Closed",
+    ];
 
     // ---- 属性配对 ----
 
@@ -1682,7 +1743,7 @@ public sealed class CBindingGenerator(CBindingGeneratorOptions options) : ClangC
     /// <summary>
     /// 把属性草稿转换为封装生成器的输入；访问器复用方法封装逻辑，保持与普通方法一致的 Span 处理。
     /// </summary>
-    private static WrapProperty BuildWrapProperty(PropertyDraft draft)
+    private WrapProperty BuildWrapProperty(PropertyDraft draft)
     {
         WrapFunction? getter = null;
         WrapFunction? setter = null;
@@ -1695,6 +1756,7 @@ public sealed class CBindingGenerator(CBindingGeneratorOptions options) : ClangC
         return new WrapProperty
         {
             Name = draft.Name,
+            CommentLines = MemberComment(draft.Host, draft.Name),
             Type = draft.Type,
             IsStatic = draft.IsInstance is false,
             Getter = getter,
@@ -1705,12 +1767,35 @@ public sealed class CBindingGenerator(CBindingGeneratorOptions options) : ClangC
     // ---- 阶段 2：Native 导入 ----
 
     /// <summary>
-    /// 把带参数的 <c>create</c> 函数生成为托管构造函数重载；构造函数直接接管句柄所有权。
+    /// 把无参 <c>create</c> 函数生成为静态工厂，由它接管新建句柄的所有权。
     /// </summary>
     /// <remarks>
-    /// 无参 <c>create</c> 已由 SafeHandle 的默认构造函数覆盖，因此这里只处理带参数的情形，
-    /// 否则调用方无法按给定参数创建实例。
+    /// 公开无参构造函数只构造无效句柄，不能再调用原生 <c>create</c>，否则作为返回值封送时会先多创建一个原生对象。
     /// </remarks>
+    private string BuildHandleFactory(FunctionInfo info)
+    {
+        info.MemberName = AllocateMemberName(info.Host, "Create");
+
+        using StringWriter writer = CreateWriter();
+        writer.WriteLine("/// <summary>");
+        writer.WriteLine($"/// 调用原生 <c>{XmlEscape(info.NativeName)}</c> 创建并接管一个新句柄。");
+        writer.WriteLine("/// </summary>");
+        writer.WriteLine("/// <remarks>");
+        writer.WriteLine("/// 无参构造函数只构造无效句柄，创建原生对象请使用本方法。");
+        writer.WriteLine("/// </remarks>");
+        writer.Write("public static ");
+        writer.Write(info.Host.Name);
+        writer.Write(' ');
+        writer.Write(info.MemberName);
+        writer.Write("() => new((nint)");
+        writer.Write(info.ImportName);
+        writer.Write("(), true);");
+        return writer.ToString();
+    }
+
+    /// <summary>
+    /// 把带参数的 <c>create</c> 函数生成为托管构造函数重载；构造函数直接接管句柄所有权。
+    /// </summary>
     private static string BuildHandleConstructor(FunctionInfo info)
     {
         using StringWriter writer = CreateWriter();
@@ -1766,7 +1851,8 @@ public sealed class CBindingGenerator(CBindingGeneratorOptions options) : ClangC
         source.Write(options.NativeMethodAccessibility);
         source.Write(" static partial ");
         source.Write(info.ReturnComment);
-        source.Write(info.Return.Type);
+        // 导入层用 ImportType：同一次映射同时描述包装层与导入层，避免两处各自映射后不一致
+        source.Write(info.Return.ImportType ?? info.Return.Type);
         source.Write(' ');
         source.Write(info.ImportName);
         source.Write('(');
@@ -1810,7 +1896,8 @@ public sealed class CBindingGenerator(CBindingGeneratorOptions options) : ClangC
         if (includeNativeComment)
             writer.Write(parameter.Comment);
 
-        writer.Write(parameter.Mapped.Type);
+        // 只被导入层使用的格式化入口，因此这里取 ImportType；包装层走 BuildWrapParameters，仍用 Type
+        writer.Write(parameter.Mapped.ImportType ?? parameter.Mapped.Type);
         writer.Write(' ');
         writer.Write(parameter.Name);
         return writer.ToString();
@@ -1890,6 +1977,9 @@ public sealed class CBindingGenerator(CBindingGeneratorOptions options) : ClangC
 
             _wrap.WriteHostFiles(host.Name, WrapKindOf(host), host.Members);
         }
+
+        if (options.Quiet)
+            return;
 
         Console.WriteLine($"生成了 {_functions.Count} 个函数、{_typeSources.Count} 个类型的 C# 绑定。");
         if (functionCount > _functions.Count)
@@ -2045,7 +2135,14 @@ public sealed class CBindingGenerator(CBindingGeneratorOptions options) : ClangC
     /// <summary>
     /// 映射后的 C# 类型：类型文本与附加特性（不含方括号）。
     /// </summary>
-    private readonly record struct MappedType(string Type, string[] Attributes, string NativeSpelling);
+    /// <param name="Type">包装 API 使用的类型文本。</param>
+    /// <param name="Attributes">附加特性，不加方括号。</param>
+    /// <param name="NativeSpelling">原生类型拼写。</param>
+    /// <param name="ImportType">
+    /// 导入声明使用的类型文本；为 null 时沿用 <paramref name="Type"/>。
+    /// 可空句柄参数用它区分「包装层 <c>Xxx?</c>」与「导入层 <c>SafeHandle?</c>」。
+    /// </param>
+    private readonly record struct MappedType(string Type, string[] Attributes, string NativeSpelling, string? ImportType = null);
 
     /// <summary>
     /// 导入方法参数：托管名、映射结果、原生类型标注与原生类型本身。
