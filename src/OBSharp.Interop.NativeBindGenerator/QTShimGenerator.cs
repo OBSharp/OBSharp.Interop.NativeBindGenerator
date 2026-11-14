@@ -127,7 +127,27 @@ public sealed partial class QTShimGenerator(QTShimGeneratorOptions options) : Cp
     /// 不可编译转换（C2440）。
     /// </remarks>
     protected override string? ReturnCType(CXType resultType, string? handleFallback)
-        => IsQStringValueReturn(resultType) ? "const char*" : base.ReturnCType(resultType, handleFallback);
+    {
+        if (IsQStringValueReturn(resultType))
+            return "const char*";
+
+        // QString* 返回位：指针不是字符串内容，不能映射成 char*（QString::data() 会报 C2440）
+        // 基类会按记录指针给出句柄或降级指针，这里显式确保不走 const char*
+        if (IsQStringPointerReturn(resultType))
+            return "void*";
+
+        return base.ReturnCType(resultType, handleFallback);
+    }
+
+    /// <summary>
+    /// 返回值是否为 <c>QString*</c>（指针形态的字符串，不能按内容封送）。
+    /// </summary>
+    private static bool IsQStringPointerReturn(CXType resultType)
+    {
+        CXType shape = Canonical(resultType);
+        return shape.kind is CXTypeKind.CXType_Pointer
+            && IsQString(Canonical(shape.PointeeType));
+    }
 
     /// <summary>
     /// 返回值是否为**按值**的 <c>QString</c>（剥掉 typedef/elaborated 后仍是记录类型本身）。
@@ -150,14 +170,20 @@ public sealed partial class QTShimGenerator(QTShimGeneratorOptions options) : Cp
     /// <summary>
     /// <c>QString</c> 按 UTF-8 字符串传递：值本身是 <c>char</c>，指针是 <c>char*</c>。
     /// </summary>
+    /// <remarks>
+    /// 只有**按值**的 <c>QString</c> 才做内容封送。`QString*` 是**出参**（库会把结果写进去），
+    /// 若也当 <c>char*</c> 入参封送就会出现「出参当入参」的方向错误（QLockFile::getLockInfo，C2664），
+    /// 因此 <c>QString*</c> 一律降级为裸指针。
+    /// </remarks>
     protected override string? ParameterCType(CXType canonical, bool indirect)
     {
         CXType shape = Canonical(canonical);
         if (IsQString(shape))
             return "char";
 
+        // 指针/引用形态的 QString：出参语义，降级为裸指针，不做内容封送
         if (shape.kind is CXTypeKind.CXType_Pointer && IsQString(Canonical(shape.PointeeType)))
-            return indirect ? "char**" : "char*";
+            return indirect ? "void**" : "void*";
 
         return base.ParameterCType(canonical, indirect);
     }
@@ -175,8 +201,9 @@ public sealed partial class QTShimGenerator(QTShimGeneratorOptions options) : Cp
         if (IsQString(shape))
             return $"QString::fromUtf8({name})";
 
+        // QString* 是出参：不做内容封送，只把裸指针还原成 QString*（库会往里写）
         if (shape.kind is CXTypeKind.CXType_Pointer && IsQString(Canonical(shape.PointeeType)))
-            return $"QString::fromUtf8(*reinterpret_cast<char**>({name}))";
+            return $"reinterpret_cast<QString*>({name})";
 
         return base.BuildToCppExpression(name, canonical, cType, cppType);
     }
@@ -296,7 +323,13 @@ public sealed partial class QTShimGenerator(QTShimGeneratorOptions options) : Cp
         string name = "p" + index.ToString(CultureInfo.InvariantCulture);
         string cType = parameter.CType ?? "";
         if (cType.EndsWith('*') is false)
-            return name;
+        {
+            // 形参是标量：枚举必须显式转换，C++ 不会把 enum class 隐式转成 int32_t
+            // （QRangeModel::AutoConnectPolicy 作为信号实参时就漏了这一步，C2664）
+            return Canonical(argument.Type).kind is CXTypeKind.CXType_Enum
+                ? "static_cast<" + cType + ">(" + name + ")"
+                : name;
+        }
 
         // 实参已是指针：直接强转为形参类型（不取址，否则指针套指针）
         if (Canonical(argument.Type).kind is CXTypeKind.CXType_Pointer)

@@ -1085,7 +1085,7 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
             CXTypeKind.CXType_ULongLong => "unsigned long long",
             CXTypeKind.CXType_Float => "float",
             CXTypeKind.CXType_Double => "double",
-            CXTypeKind.CXType_Record => RecordCppName(canonical),
+            CXTypeKind.CXType_Record => IsTypeVisible(canonical) ? RecordCppName(canonical) : "void",
             CXTypeKind.CXType_Enum => QualifiedName(canonical.Declaration),
             CXTypeKind.CXType_Pointer => CppPointeeOf(canonical) + "*",
             CXTypeKind.CXType_LValueReference or CXTypeKind.CXType_RValueReference
@@ -1177,6 +1177,17 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
                     }
 
                     return true;
+                }
+
+            // enum 也可以是 private/protected 的嵌套声明（QLibrary::LoadStatusTag 就是 private enum），
+            // 此前只判 Record，enum 落到 default 直接放行，导致它作为模板实参时漏网
+            case CXTypeKind.CXType_Enum:
+                {
+                    CXCursor declaration = shape.Declaration;
+                    if (declaration.IsNull)
+                        return true;
+
+                    return IsTypeVisibleAtCursor(declaration);
                 }
 
             default:
