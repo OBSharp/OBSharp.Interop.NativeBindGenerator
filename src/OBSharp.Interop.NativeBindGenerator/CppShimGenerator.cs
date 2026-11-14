@@ -1035,8 +1035,13 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
             ? ToIdentifier(spelling)
             : "arg" + index.ToString(CultureInfo.InvariantCulture);
 
-        string cType = ParameterCType(canonical, indirect: false)!;
+        string? cType = ParameterCType(canonical, indirect: false);
         string cppType = CppTypeOf(canonical);
+
+        // 不可见/不可绑定的值位或引用位形参无法安全降级，以 null 表示「这条导出不能生成」
+        if (cType is null)
+            return new(name, canonical, ParameterSuffix(canonical), null, cppType, name);
+
         return new(name, canonical, ParameterSuffix(canonical), cType, cppType, BuildToCppExpression(name, canonical, cType, cppType));
     }
 
@@ -1085,7 +1090,7 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
             CXTypeKind.CXType_ULongLong => "unsigned long long",
             CXTypeKind.CXType_Float => "float",
             CXTypeKind.CXType_Double => "double",
-            CXTypeKind.CXType_Record => IsTypeVisible(canonical) ? RecordCppName(canonical) : "void",
+            CXTypeKind.CXType_Record => RecordCppName(canonical),
             CXTypeKind.CXType_Enum => QualifiedName(canonical.Declaration),
             CXTypeKind.CXType_Pointer => CppPointeeOf(canonical) + "*",
             CXTypeKind.CXType_LValueReference or CXTypeKind.CXType_RValueReference
@@ -1201,10 +1206,69 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
     /// <remarks>
     /// <see cref="IsTypeVisible"/> 是纯静态判定，无法访问派生类的 <see cref="IsVisibleToCaller"/> 覆盖，
     /// 因此这里给出等价的基础判定；框架特化若需要更严格的规则，应同步该方法。
+    /// **enum 的访问级别要沿 <c>SemanticParent</c> 查**：libclang 对 enum 声明本身常返回
+    /// <c>CX_CXXInvalidAccessSpecifier</c>（QLibrary::LoadStatusTag 就是这样漏网的），
+    /// 必须回到所属类里扫描兄弟声明，找到它前面最近的那个访问说明符。
     /// </remarks>
     private static bool IsTypeVisibleAtCursor(CXCursor declaration)
-        => declaration.CXXAccessSpecifier is CX_CXXAccessSpecifier.CX_CXXInvalidAccessSpecifier
-            or CX_CXXAccessSpecifier.CX_CXXPublic;
+    {
+        CX_CXXAccessSpecifier own = declaration.CXXAccessSpecifier;
+        if (own is not (CX_CXXAccessSpecifier.CX_CXXInvalidAccessSpecifier
+            or CX_CXXAccessSpecifier.CX_CXXPublic))
+        {
+            return false;
+        }
+
+        if (own is CX_CXXAccessSpecifier.CX_CXXPublic)
+            return true;
+
+        // 声明自身没带访问说明符：若它是嵌套声明，回到父级扫描访问段
+        return IsNestedInPublicSection(declaration);
+    }
+
+    /// <summary>
+    /// 嵌套声明是否位于所属类的 public 段。
+    /// </summary>
+    /// <remarks>
+    /// clang 把访问说明符作为独立子节点序列化（<c>CXCursor_CXXAccessSpecifier</c>），
+    /// 因此按声明顺序线性扫描父级 children，记录「最近一个访问说明符」，到目标声明为止。
+    /// </remarks>
+    private static bool IsNestedInPublicSection(CXCursor declaration)
+    {
+        CXCursor parent = declaration.SemanticParent;
+        if (parent.IsNull || parent.kind is CXCursorKind.CXCursor_TranslationUnit)
+            return true;
+
+        // 类模板的成员挂在模板声明下，再往上找一层
+        if (parent.kind is CXCursorKind.CXCursor_ClassTemplate
+            or CXCursorKind.CXCursor_ClassTemplatePartialSpecialization)
+        {
+            CXCursor owner = parent.SemanticParent;
+            if (!owner.IsNull && owner.kind is not CXCursorKind.CXCursor_TranslationUnit)
+                parent = owner;
+        }
+
+        CX_CXXAccessSpecifier current = parent.kind is CXCursorKind.CXCursor_ClassDecl
+            ? CX_CXXAccessSpecifier.CX_CXXPrivate
+            : CX_CXXAccessSpecifier.CX_CXXPublic;
+
+        int count = parent.NumChildren;
+        for (int i = 0; i < count; i++)
+        {
+            CXCursor child = parent.GetChild((uint)i);
+            if (child.kind is CXCursorKind.CXCursor_CXXAccessSpecifier)
+            {
+                current = child.CXXAccessSpecifier;
+                continue;
+            }
+
+            if (child.CanonicalCursor.Hash == declaration.CanonicalCursor.Hash)
+                return current is CX_CXXAccessSpecifier.CX_CXXPublic;
+        }
+
+        // 找不到目标声明时按未匹配处理（保守视为不可见由调用方决定）
+        return current is CX_CXXAccessSpecifier.CX_CXXPublic;
+    }
 
     /// <summary>
     /// 目标类型的 <c>const</c> 限定前缀。
@@ -1260,10 +1324,12 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
     /// </summary>
     protected virtual string? ParameterCType(CXType canonical, bool indirect)
     {
-        // 签名里出现不可见类型（private/protected 嵌套类、含不可见实参的模板实例）时降级为 void*，
-        // 否则 C++ 侧引用该名字会直接报 C2248（QList<QObject*>::DisableRValueRefs 这类）
-        if (Canonical(canonical).kind is CXTypeKind.CXType_Record && IsTypeVisible(canonical) is false)
-            return indirect ? "void**" : "void*";
+        // 不可见类型的降级必须**按位置区分**（降级规则表）：
+        //   指针形参   → void* 合法可用
+        //   引用形参   → 返回 null（不生成该导出）：降 void* 会让实参生成仍按引用解引用，产生 `*void`
+        //   按值形参   → 返回 null（不生成该导出）：绝不能写 `void`，`void p3` 永远非法（C2860）
+        if (IsTypeVisible(canonical) is false)
+            return canonical.kind is CXTypeKind.CXType_Pointer ? "void*" : null;
 
         switch (canonical.kind)
         {
@@ -1701,6 +1767,52 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
     [GeneratedRegex(@"CPP_SHIM_CALL[^\r\n]*\((?<params>[^)]*)\)\s*\r?\n\{\s*\r?\n\s*auto\* (?<name>[A-Za-z_][A-Za-z0-9_]*)\s*=", RegexOptions.Compiled | RegexOptions.CultureInvariant)]
     private static partial Regex LocalDeclarationRegex { get; }
 
+    /// <summary>
+    /// 写出前自检：形参表不得出现 <c>void</c> 形参，且不得出现对 <c>void*</c> 的解引用。
+    /// </summary>
+    /// <remarks>
+    /// 这两条都是**降级策略用错位置**留下的痕迹，实测都曾引出成片错误：
+    /// ① <c>void p3</c> 在形参表里永远非法（C2860×32）；
+    /// ② <c>*reinterpret_cast&lt;void*&gt;(x)</c> 是对 void 的解引用（C2100×5）。
+    /// 只要出现就说明某处把「不可绑定的值/引用」错误地降成了 <c>void</c>/<c>void*</c>，
+    /// 因此直接让生成失败，而不是产出编译不过的产物。
+    /// </remarks>
+    private static void AssertNoVoidMisuse(IEnumerable<GeneratedFile> files)
+    {
+        foreach (GeneratedFile file in files)
+        {
+            if (file.Name.EndsWith(".cpp", StringComparison.Ordinal) is false)
+                continue;
+
+            if (VoidParameterRegex.IsMatch(file.Content))
+            {
+                throw new InvalidOperationException(
+                    "生成的 shim 形参表中出现了 void 形参（C2860）：" + file.Name);
+            }
+
+            if (VoidDereferenceRegex.IsMatch(file.Content))
+            {
+                throw new InvalidOperationException(
+                    "生成的 shim 中出现对 void* 的解引用（C2100）：" + file.Name);
+            }
+        }
+    }
+
+    /// <summary>
+    /// 形参表里的 <c>void</c> 形参（唯一的 <c>(void)</c> 表示「无参」是合法的，因此排除它）。
+    /// </summary>
+    /// <remarks>
+    /// 只匹配带名字的 <c>void 标识符</c> 形态，以及 <c>, void,</c> / <c>, void)</c> 这类列表中间或末尾的裸 void。
+    /// </remarks>
+    [GeneratedRegex(@"\(\s*void\s*[A-Za-z_][A-Za-z0-9_]*\s*[,)]|,\s*void\s*[,)]|,\s*void\s+[A-Za-z_][A-Za-z0-9_]*\s*[,)]", RegexOptions.Compiled | RegexOptions.CultureInvariant)]
+    private static partial Regex VoidParameterRegex { get; }
+
+    /// <summary>
+    /// 对 <c>void*</c> 结果的解引用：<c>*reinterpret_cast&lt;void*&gt;(...)</c>。
+    /// </summary>
+    [GeneratedRegex(@"\*\s*reinterpret_cast<void\s*\*>", RegexOptions.Compiled | RegexOptions.CultureInvariant)]
+    private static partial Regex VoidDereferenceRegex { get; }
+
     private static void AssertNoBareTemplateNames(IEnumerable<GeneratedFile> files, HashSet<string> templateNames)
     {
         if (templateNames.Count is 0)
@@ -1814,6 +1926,9 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
 
         // 写出前断言：局部变量不得与形参重名（C2082）
         AssertNoLocalShadowsParameter(Files);
+
+        // 写出前断言：不得出现 void 形参（C2860）或对 void* 的解引用（C2100）
+        AssertNoVoidMisuse(Files);
 
         // 写正文，再释放嵌入的转换头文件，最后清理本轮未产出的旧产物
         foreach (GeneratedFile file in Files)
