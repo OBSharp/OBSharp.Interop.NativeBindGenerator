@@ -435,6 +435,10 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
             return;
         }
 
+        // 迭代器/哨兵等依附型类型没有独立的构造语义，其生命周期由所属容器掌握（C2512/C2514 残余来源）
+        if (IsIteratorLikeType(definition))
+            return;
+
         // 抽象类无法实例化（C2259），不能为它生成 new 导出
         if (definition.CXXRecord_IsAbstract)
             return;
@@ -675,11 +679,13 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
     }
 
     /// <summary>
-    /// 无宿主前缀的自由函数是否不应成为 C 导出：内联函数、Qt 的 <c>q*</c> 工具函数、CRT 保留名。
+    /// 无宿主前缀的自由函数是否不应成为 C 导出：内联函数、Qt 的 <c>q</c>/<c>qt_</c> 工具函数、CRT 保留名。
     /// </summary>
     /// <remarks>
     /// 只针对**没有** <c>--export-prefix</c> 前缀的名字：带前缀的自由函数是调用方用该前缀
-    /// 明确约定引入的导出，即使名字看起来像 Qt 宏也照常生成。
+    /// 明确约定引入的导出，即使名字看起来像 Qt 工具函数也照常生成。
+    /// 判定按前缀族而不是逐个枚举名字：Qt 的 <c>q</c>/<c>qt_</c> 工具函数与 CRT 的 <c>__</c> 静态函数
+    /// 会随版本不断新增，逐个列举必然漏网（alpha.9 就以 qErrnoWarning、qSNaN、qYieldCpu 等漏出 24 条错误）。
     /// </remarks>
     private bool IsNonBindableFreeFunction(CXCursor declaration, string name)
     {
@@ -690,12 +696,25 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
         if (name.StartsWith(ShimOptions.ExportPrefix, StringComparison.Ordinal))
             return false;
 
-        if (NonBindableFunctionNames.Contains(name))
+        // Qt 工具函数族：即使被编译成非内联的库导出，也不是面向 C 的公开接口
+        if (IsQtUtilityName(name))
             return true;
 
-        // CRT 的静态链接函数使用下划线保留名（__security_*、_invalid_parameter_* 等）
-        return name.StartsWith('_') && LooksLikeCrtReservedName(name);
+        // CRT / 编译器运行时：(__ 开头的所有保留名，例如 __report_gsfailure、__security_*、__CxxThrowException
+        return name.StartsWith("__", StringComparison.Ordinal)
+            || (name.StartsWith('_') && LooksLikeCrtReservedName(name));
     }
+
+    /// <summary>
+    /// Qt 工具函数名：<c>q</c> 前缀的宏/内联函数族与 <c>qt_</c> 内部命名空间族。
+    /// </summary>
+    /// <remarks>
+    /// <c>q</c> 族按「首字符 <c>q</c>、第二字符是大写字母」判定（<c>qBadAlloc</c>、<c>qSNaN</c>、<c>qInf</c>、<c>qIsInf</c>、<c>qYieldCpu</c>），
+    /// 这样不会误伤 <c>query</c>、<c>quit</c>、<c>qt_noop</c> 之外的普通业务函数名。
+    /// </remarks>
+    private static bool IsQtUtilityName(string name)
+        => name.StartsWith("qt_", StringComparison.Ordinal)
+            || (name.Length >= 2 && name[0] is 'q' && char.IsUpper(name[1]));
 
     /// <summary>
     /// 声明是否为内联函数。
@@ -736,24 +755,11 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
     private static partial Regex InlineKeywordRegex { get; }
 
     /// <summary>
-    /// 不应导出为 C 接口的函数名：Qt 工具函数与 CRT 静态链接函数。
+    /// 形如 <c>_*</c> 且带工具集气息的保留名；用于兜住 CRT 未来的同类静态函数。
     /// </summary>
-    private static readonly HashSet<string> NonBindableFunctionNames =
-    [
-        "qt_noop",
-        "__security_init_cookie",
-        "__security_check_cookie",
-        "_invalid_parameter_noinfo",
-        "_invalid_parameter_noinfo_noreturn",
-        "__report_rangecheckfailure",
-        "__CxxThrowException",
-        "_RTC_InitBase",
-        "_RTC_Shutdown",
-    ];
-
-    /// <summary>
-    /// 形如 <c>__*</c> / <c>_*</c> 且带工具集气息的保留名；用于兜住 CRT 未来的同类静态函数。
-    /// </summary>
+    /// <remarks>
+    /// <c>__</c> 前缀已在 <see cref="IsNonBindableFreeFunction"/> 里整族排除，这里只处理单下划线族。
+    /// </remarks>
     private static bool LooksLikeCrtReservedName(string name)
         => name.Contains("parameter", StringComparison.OrdinalIgnoreCase)
             || name.Contains("security", StringComparison.OrdinalIgnoreCase)
@@ -781,6 +787,12 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
             return;
 
         string symbol = UniqueSymbol(BuildSymbol(baseName, parameters));
+
+        // 按值返回的不可绑定记录类型不能映射成 cpp_shim_X*：C++ 侧 return 的是值本身，
+        // 塞进指针返回位会报 C2440（Qt Core 实测 100 条，例如 QPropertyBindingError、QBindable<...>）
+        if (role is not (ShimRole.New or ShimRole.Finalize) && IsUnbindableValueReturn(declaration.ResultType))
+            return;
+
         // 构造函数对外始终返回句柄指针；析构返回 void；其余按原生返回值映射
         string returnCType = role switch
         {
@@ -874,7 +886,7 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
             CXTypeKind.CXType_ULongLong => "unsigned long long",
             CXTypeKind.CXType_Float => "float",
             CXTypeKind.CXType_Double => "double",
-            CXTypeKind.CXType_Record => QualifiedName(canonical.Declaration),
+            CXTypeKind.CXType_Record => RecordCppName(canonical),
             CXTypeKind.CXType_Enum => QualifiedName(canonical.Declaration),
             CXTypeKind.CXType_Pointer => CppPointeeOf(canonical) + "*",
             CXTypeKind.CXType_LValueReference or CXTypeKind.CXType_RValueReference
@@ -892,10 +904,31 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
         if (pointee.kind is CXTypeKind.CXType_Void)
             return qualifier + "void";
 
-        if (pointee.kind is CXTypeKind.CXType_Record or CXTypeKind.CXType_Enum)
+        if (pointee.kind is CXTypeKind.CXType_Record)
+            return qualifier + RecordCppName(pointee);
+
+        if (pointee.kind is CXTypeKind.CXType_Enum)
             return qualifier + QualifiedName(pointee.Declaration);
 
         return qualifier + CppTypeOf(pointee);
+    }
+
+    /// <summary>
+    /// 记录类型的 C++ 完整拼写：模板实例必须带参数列表。
+    /// </summary>
+    /// <remarks>
+    /// <c>QualifiedName</c> 只沿语义父级拼名字，模板实例会退化成裸模板名
+    /// （<c>QFlags</c>、<c>std::chrono::duration</c>），在 C++ 侧直接报 C2955。
+    /// 因此优先采用 libclang 给的完整拼写；只有在拼写缺失时才回退到限定名。
+    /// </remarks>
+    private static string RecordCppName(CXType type)
+    {
+        string spelling = type.Spelling.ToString();
+        if (spelling.Length is not 0)
+            return spelling;
+
+        CXCursor declaration = type.Declaration;
+        return declaration.IsNull ? "void" : QualifiedName(declaration);
     }
 
     /// <summary>
@@ -1037,9 +1070,34 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
         return ScalarCType(result) ?? handleFallback;
     }
 
-    protected string UniqueSymbol(string name)
+    /// <summary>
+    /// 返回值是否属于「按值返回、且无法安全桥接到 C」的记录类型。
+    /// </summary>
+    /// <remarks>
+    /// shim 对记录类型一律用不透明句柄指针表达，而按值返回时 C++ 侧 <c>return</c> 的是对象本身，
+    /// 塞进 <c>cpp_shim_X*</c> 返回位会直接报 C2440（Qt Core 实测 100 条：QPropertyBindingError、
+    /// QMetaType、QBindable&lt;T&gt;、各容器 const_iterator 等）。C 侧既没有这些类型的完整定义，
+    /// 也无法安全地把它当成句柄长期持有，因此**按值返回的记录类型一律不生成导出**。
+    /// 引用/指针返回不受影响（它们本来就是句柄语义）。
+    /// </remarks>
+    private static bool IsUnbindableValueReturn(CXType resultType)
+        => Canonical(resultType).kind is CXTypeKind.CXType_Record;
+
+    /// <summary>
+    /// 名称表明是迭代器/哨兵/私有信号之类的「依附型」类型。
+    /// </summary>
+    private static bool IsIteratorLikeType(CXCursor declaration)
     {
-        string candidate = name;
+        string name = declaration.Spelling.ToString();
+        return name.Contains("iterator", StringComparison.OrdinalIgnoreCase)
+            || name.Contains("const_iterator", StringComparison.OrdinalIgnoreCase)
+            || name is "It" or "Sentinel" or "_Sentinel"
+            || name.EndsWith("Iterator", StringComparison.Ordinal)
+            || name.EndsWith("ConstIterator", StringComparison.Ordinal);
+    }
+
+    protected string UniqueSymbol(string name)
+    {        string candidate = name;
         int suffix = 1;
         while (!UsedSymbols.Add(candidate))
         {
