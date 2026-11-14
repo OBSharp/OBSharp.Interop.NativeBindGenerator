@@ -25,6 +25,11 @@ public class CppShimGenerator(CppShimGeneratorOptions options) : ClangCollector
     protected List<ShimFunctionInfo> Functions { get; } = [];
     protected Dictionary<uint, ShimTypeInfo> TypeByKey { get; } = [];
     protected HashSet<string> UsedSymbols { get; } = [with(StringComparer.Ordinal)];
+
+    /// <summary>
+    /// 头文件里实际引用到的全部句柄类型名：已登记类型与临时换算类型都在此登记，按名字去重。
+    /// </summary>
+    protected HashSet<string> HandleDeclarations { get; } = [with(StringComparer.Ordinal)];
     protected List<GeneratedFile> Files { get; } = [];
 
     /// <summary>
@@ -260,6 +265,7 @@ public class CppShimGenerator(CppShimGeneratorOptions options) : ClangCollector
 
         TypeByKey.Add(key, type);
         Types.Add(type);
+        HandleDeclarations.Add(type.HandleName);
     }
 
     protected static string RecordKeyword(CXCursorKind kind)
@@ -277,12 +283,19 @@ public class CppShimGenerator(CppShimGeneratorOptions options) : ClangCollector
         => ShimOptions.ExportPrefix + "_" + ToIdentifier(QualifiedName(declaration).Replace("::", "_", StringComparison.Ordinal));
 
     /// <summary>
-    /// 已登记类型的句柄名；未登记时退化为按限定名即时换算（仅用于参数/返回值的临时类型）。
+    /// 已登记类型的句柄名；未登记时退化为按限定名即时换算（用于参数/返回值里的临时类型，例如
+    /// Qt 私有嵌套类型与模板实例）。这种类型没有自己的成员导出，但同样要在头文件里补前置声明，
+    /// 否则在 <c>extern "C"</c> 下会被编译器当成未知类型（MSVC 按 int 处理，Qt Core 产物因此编译失败）。
     /// </summary>
     private string ResolveHandleName(CXCursor declaration)
     {
         ShimTypeInfo? known = TypeByKey.GetValueOrDefault(KeyOf(declaration));
-        return known?.HandleName ?? CandidateHandleName(declaration);
+        if (known is not null)
+            return known.HandleName;
+
+        string name = CandidateHandleName(declaration);
+        HandleDeclarations.Add(name);
+        return name;
     }
 
     private void EnsureFieldDependencies(ShimTypeInfo type)
@@ -965,6 +978,9 @@ public class CppShimGenerator(CppShimGeneratorOptions options) : ClangCollector
 
         RemoveStaleOutputs([.. Files.Select(file => file.Name), CppShimMarshal.FileName]);
 
+        if (ShimOptions.Quiet)
+            return;
+
         Console.WriteLine(
             $"C++ shim 生成了 {Functions.Count} 个导出、{Types.Count} 个类型、{libraries.Count} 个库。");
     }
@@ -980,6 +996,22 @@ public class CppShimGenerator(CppShimGeneratorOptions options) : ClangCollector
             ? ShimOptions.BaseName + "." + source.Index.ToString(CultureInfo.InvariantCulture) + ".cpp"
             : ShimOptions.BaseName + "." + library.Index.ToString(CultureInfo.InvariantCulture)
                 + "." + source.Index.ToString(CultureInfo.InvariantCulture) + ".cpp";
+
+    /// <summary>
+    /// CMake 清单里显式库列表的变量名：目标名转大写，非字母数字字符统一替换为下划线。
+    /// </summary>
+    /// <remarks>
+    /// CMake 目标名允许 <c>.</c>（如 <c>OBSharp.Interop.Qt.Native</c>），但带点号的变量名在
+    /// <c>${}</c> / <c>LISTS</c> 中容易与组件语法混淆，因此列表变量一律规范化成字母数字与下划线。
+    /// </remarks>
+    private string LibraryListVariableName()
+    {
+        StringBuilder builder = new(ShimOptions.TargetName.Length);
+        foreach (char character in ShimOptions.TargetName.ToUpperInvariant())
+            builder.Append(char.IsLetterOrDigit(character) ? character : '_');
+
+        return builder + "_LIBRARIES";
+    }
 
     /// <summary>
     /// 导出符号到库名的映射清单，供 <see cref="CBindingGenerator"/> 使用。
@@ -1021,8 +1053,12 @@ public class CppShimGenerator(CppShimGeneratorOptions options) : ClangCollector
     }
 
     /// <summary>
-    /// shim 头文件：不透明句柄声明 + extern "C" 导出声明。
+    /// shim 头文件：句柄前置声明块 + extern "C" 导出声明。
     /// </summary>
+    /// <remarks>
+    /// 前置声明块把全部句柄类型统一声明一次，既避免「先引用后 typedef」在 <c>extern "C"</c> 下被当成未知类型，
+    /// 也把同名句柄（模板实例、宏生成名）归一到一次输出。
+    /// </remarks>
     protected virtual string BuildHeader()
     {
         using StringWriter writer = CreateWriter();
@@ -1038,15 +1074,7 @@ public class CppShimGenerator(CppShimGeneratorOptions options) : ClangCollector
         writer.WriteLine("#endif");
         writer.WriteLine();
 
-        foreach (ShimTypeInfo type in Types)
-        {
-            writer.WriteLine("// " + type.Keyword + " " + type.CppName);
-            // 只声明不定义，C# 侧才会按不透明句柄生成 SafeHandle
-            writer.WriteLine("typedef struct " + type.HandleName + " " + type.HandleName + ";");
-        }
-
-        if (Types.Count is not 0)
-            writer.WriteLine();
+        WriteHandleDeclarations(writer);
 
         foreach (ShimFunctionInfo function in Functions)
             WriteFunctionDeclaration(writer, function);
@@ -1055,6 +1083,28 @@ public class CppShimGenerator(CppShimGeneratorOptions options) : ClangCollector
         writer.WriteLine("}");
         writer.WriteLine("#endif");
         return writer.ToString();
+    }
+
+    /// <summary>
+    /// 统一的句柄前置声明块：先集中声明，再给已登记类型逐条附上原生类型注释。
+    /// </summary>
+    private void WriteHandleDeclarations(StringWriter writer)
+    {
+        if (HandleDeclarations.Count is 0)
+            return;
+
+        writer.WriteLine("// 句柄前置声明：所有被引用的不透明类型，避免在 extern \"C\" 下出现未知类型。");
+        foreach (string handle in HandleDeclarations.OrderBy(value => value, StringComparer.Ordinal))
+            writer.WriteLine("typedef struct " + handle + " " + handle + ";");
+
+        // 已登记类型再补一条原生类型注释，便于对照；同名句柄只在这里多出现一次注释行
+        foreach (ShimTypeInfo type in Types)
+        {
+            writer.WriteLine("// " + type.Keyword + " " + type.CppName);
+            writer.WriteLine("typedef struct " + type.HandleName + " " + type.HandleName + ";");
+        }
+
+        writer.WriteLine();
     }
 
     protected virtual void WriteFunctionDeclaration(StringWriter writer, ShimFunctionInfo function)
@@ -1199,13 +1249,27 @@ public class CppShimGenerator(CppShimGeneratorOptions options) : ClangCollector
         writer.WriteLine();
 
         foreach (string header in ShimOptions.Headers)
-        {
-            writer.Write("#include \"");
-            writer.Write(header.Replace('\\', '/'));
-            writer.WriteLine("\"");
-        }
+            writer.WriteLine("#include \"" + IncludePath(header) + "\"");
 
         return writer.ToString();
+    }
+
+    /// <summary>
+    /// PCH 与实现文件 preamble 里的头文件路径。
+    /// </summary>
+    /// <remarks>
+    /// 默认写绝对路径，保证任何构建系统都能直接解析；开启 <see cref="CppShimGeneratorOptions.RelativeIncludes"/>
+    /// 后改写为相对 native 产物目录的形式，便于 ccache 等编译缓存在不同目录、不同机器之间复用。
+    /// </remarks>
+    private string IncludePath(string header)
+    {
+        if (!ShimOptions.RelativeIncludes)
+            return header.Replace('\\', '/');
+
+        string absolute = Path.GetFullPath(header);
+        string outputRoot = Path.GetFullPath(ShimOptions.Output.FullName);
+        string relative = Path.GetRelativePath(outputRoot, absolute);
+        return relative.Replace('\\', '/');
     }
 
     /// <summary>
@@ -1220,6 +1284,16 @@ public class CppShimGenerator(CppShimGeneratorOptions options) : ClangCollector
         using StringWriter writer = CreateWriter();
         writer.WriteLine("# 由 OBSharp.Interop.NativeBindGenerator 生成，请勿手工修改。");
         writer.WriteLine("# 每个库一个共享库目标；C# 侧 LibraryImport 使用的库名与下列目标输出名一致。");
+        writer.WriteLine();
+
+        // 显式库列表：下游无需靠 BUILDSYSTEM_TARGETS 反查就能知道清单建了哪些目标。
+        // 变量名把非字母数字统一替换为下划线，避免 Qt 目标名里的点号难以在 CMake 中引用
+        string libraryVariable = LibraryListVariableName();
+        writer.WriteLine("set(" + libraryVariable + "");
+        foreach (ShimLibrary library in libraries)
+            writer.WriteLine("    \"" + library.Name + "\"");
+
+        writer.WriteLine(")");
         writer.WriteLine();
 
         foreach (ShimLibrary library in libraries)
