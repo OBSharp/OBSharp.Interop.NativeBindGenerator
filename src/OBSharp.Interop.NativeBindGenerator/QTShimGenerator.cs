@@ -222,7 +222,12 @@ public sealed partial class QTShimGenerator(QTShimGeneratorOptions options) : Cp
             parameters.Add(parameter);
             cppTypes.Add(CppTypeOf(Canonical(argument.Type)));
             lambdaParameters.Add(cppTypes[i] + " p" + i.ToString(CultureInfo.InvariantCulture));
-            lambdaArguments.Add("p" + i.ToString(CultureInfo.InvariantCulture));
+
+            // C 侧记录类型形参是句柄指针，而 Qt 的信号实参是按值传来的对象（QPrivateSignal 等），
+            // 必须取地址才能匹配回调的形参类型，否则 C2664
+            lambdaArguments.Add(NeedsAddressOf(argument, parameter)
+                ? "&p" + i.ToString(CultureInfo.InvariantCulture)
+                : "p" + i.ToString(CultureInfo.InvariantCulture));
         }
 
         string callbackName = UniqueSymbol(type.SymbolPrefix + "_" + snake + "_callback");
@@ -240,6 +245,23 @@ public sealed partial class QTShimGenerator(QTShimGeneratorOptions options) : Cp
             connectionType + "*",
             parametersDeclaration,
             body);
+    }
+
+    /// <summary>
+    /// 回调实参是否需要取地址：C 侧形参是指针（句柄或 T*）而 C++ 实参是按值对象时。
+    /// </summary>
+    /// <remarks>
+    /// <c>QPrivateSignal</c> 这类按值传递的参数在 C 侧被降级成 <c>cpp_shim_*</c> 句柄指针，
+    /// lambda 里必须传 <c>&amp;pN</c> 才能匹配回调 typedef 的形参类型。
+    /// </remarks>
+    private static bool NeedsAddressOf(CXCursor argument, ShimParameterInfo parameter)
+    {
+        string cType = parameter.CType ?? "";
+        if (!cType.EndsWith('*'))
+            return false;
+
+        // 指针/引用类型的实参本身就是指针语义，不应再取地址
+        return Canonical(argument.Type).kind is CXTypeKind.CXType_Record;
     }
 
     /// <summary>

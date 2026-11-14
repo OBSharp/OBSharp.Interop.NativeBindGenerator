@@ -257,6 +257,14 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
         if (IsAccessible(declaration) is false)
             return;
 
+        // 未实例化的类模板本身不是类型：既不能 `new`，也不能在 C++ 侧以裸名出现（C2955）。
+        // 在登记阶段就剔除，避免它的 _new/_finalize/成员导出进入产物
+        if (declaration.kind is CXCursorKind.CXCursor_ClassTemplate
+            or CXCursorKind.CXCursor_ClassTemplatePartialSpecialization)
+        {
+            return;
+        }
+
         uint key = KeyOf(declaration);
         if (TypeByKey.ContainsKey(key))
             return;
@@ -437,6 +445,11 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
 
         // 迭代器/哨兵等依附型类型没有独立的构造语义，其生命周期由所属容器掌握（C2512/C2514 残余来源）
         if (IsIteratorLikeType(definition))
+            return;
+
+        // 引用/代理类型（QBitRef、QArrayDataPointerRef 等）只是容器提供的临时视图，
+        // 没有可用的默认构造，也不能由调用方 `new` 出来
+        if (IsProxyType(definition))
             return;
 
         // 抽象类无法实例化（C2259），不能为它生成 new 导出
@@ -802,6 +815,8 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
         };
         bool returnsVoid = role is ShimRole.Finalize
             || Canonical(declaration.ResultType).kind is CXTypeKind.CXType_Void;
+        bool returnsEnum = role is not (ShimRole.New or ShimRole.Finalize)
+            && Canonical(declaration.ResultType).kind is CXTypeKind.CXType_Enum;
 
         ShimFunctionInfo function = role switch
         {
@@ -813,7 +828,10 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
                 returnCType,
                 declaration.Spelling.ToString(),
                 returnsVoid,
-                null),
+                null)
+            {
+                ReturnsEnum = returnsEnum,
+            },
             ShimRole.Free => new(
                 owner,
                 role,
@@ -822,7 +840,10 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
                 returnCType,
                 null,
                 returnsVoid,
-                QualifiedName(declaration)),
+                QualifiedName(declaration))
+            {
+                ReturnsEnum = returnsEnum,
+            },
             _ => new(owner, role, parameters, symbol, returnCType, null, returnsVoid, null),
         };
 
@@ -854,8 +875,9 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
                 => "*reinterpret_cast<" + cppType + "*>(" + name + ")",
             CXTypeKind.CXType_Enum
                 => "static_cast<" + cppType + ">(" + name + ")",
+            // 指针形参的 cppType 已包含完整指针层级，这里原样强转，不能再补 *
             CXTypeKind.CXType_Pointer when cType is "void*"
-                => "static_cast<" + cppType + "*>(" + name + ")",
+                => "static_cast<" + cppType + ">(" + name + ")",
             CXTypeKind.CXType_Pointer
                 => "reinterpret_cast<" + cppType + ">(" + name + ")",
             _ => name,
@@ -1094,6 +1116,72 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
             || name is "It" or "Sentinel" or "_Sentinel"
             || name.EndsWith("Iterator", StringComparison.Ordinal)
             || name.EndsWith("ConstIterator", StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// 引用/代理类型：容器或算法提供的临时视图，不能由调用方构造。
+    /// </summary>
+    /// <remarks>
+    /// 判定组合「名字以 <c>Ref</c> / <c>PointerRef</c> 之类视图名结尾 + 没有用户声明的公开构造函数」。
+    /// 代理类型通常不声明构造函数（隐含的默认构造在这种「只由容器产生」的视图上没有意义），
+    /// 因此这里判断的是「是否有用户声明的构造」，而不是「能否默认构造」。
+    /// </remarks>
+    private static bool IsProxyType(CXCursor declaration)
+    {
+        string name = declaration.Spelling.ToString();
+        bool nameSuggestsProxy = name.EndsWith("Ref", StringComparison.Ordinal)
+            || name.EndsWith("Refs", StringComparison.Ordinal)
+            || name.EndsWith("PointerRef", StringComparison.Ordinal);
+
+        if (nameSuggestsProxy is false)
+            return false;
+
+        return HasUserDeclaredConstructor(declaration) is false;
+    }
+
+    /// <summary>
+    /// 记录类型是否声明了任何（非隐式、非删除的）构造函数。
+    /// </summary>
+    /// <summary>
+    /// 记录类型是否在源码中声明了任何构造函数。
+    /// </summary>
+    /// <remarks>
+    /// 不能依赖 <c>CXCursor.IsImplicit</c>：只有声明、没有定义的构造函数也会被 libclang 标记为 implicit
+    /// （实测 <c>QRef(int);</c> → <c>implicit=True</c>）。改为按「有参数」或「有源码位置」判断用户声明：
+    /// 隐式生成的默认构造既没有参数、也指向类声明所在行。
+    /// </remarks>
+    private static bool HasUserDeclaredConstructor(CXCursor definition)
+    {
+        int count = definition.NumCtors;
+        for (int i = 0; i < count; i++)
+        {
+            CXCursor ctor = definition.GetCtor((uint)i);
+            if (ctor.IsDeleted)
+                continue;
+
+            // 有参数的重载必然是用户显式声明的
+            if (ctor.NumArguments is not 0)
+                return true;
+
+            // 无参情形：隐式默认构造的位置与类声明重合，用户声明的则另有独立的源码位置
+            if (HasOwnSourceLocation(definition, ctor))
+                return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// 构造函数的源码位置是否与类声明不同（即确实是源码里写出来的）。
+    /// </summary>
+    private static bool HasOwnSourceLocation(CXCursor definition, CXCursor ctor)
+    {
+        definition.Location.GetExpansionLocation(out CXFile definitionFile, out uint definitionLine, out _, out _);
+        ctor.Location.GetExpansionLocation(out CXFile ctorFile, out uint ctorLine, out _, out _);
+        if (ctorLine is 0 || definitionLine is 0)
+            return false;
+
+        return ctorFile.Name.ToString() != definitionFile.Name.ToString() || ctorLine != definitionLine;
     }
 
     protected string UniqueSymbol(string name)
@@ -1468,18 +1556,36 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
             case ShimRole.Method:
                 {
                     writer.WriteLine("    auto* target = reinterpret_cast<" + function.Owner!.CppName + "*>(self);");
-                    string call = "target->" + function.MethodName + "(" + ArgumentList(function) + ");";
-                    writer.WriteLine(function.ReturnsVoid ? "    " + call : "    return " + call);
+                    string call = "target->" + function.MethodName + "(" + ArgumentList(function) + ")";
+                    writer.WriteLine(function.ReturnsVoid ? "    " + call + ";" : "    return " + ReturnExpression(function, call) + ";");
                     break;
                 }
 
             default:
-                writer.WriteLine("    return " + function.FreeQualifiedName + "(" + ArgumentList(function) + ");");
-                break;
+                {
+                    string call = function.FreeQualifiedName + "(" + ArgumentList(function) + ")";
+                    writer.WriteLine("    return " + ReturnExpression(function, call) + ";");
+                    break;
+                }
         }
 
         writer.WriteLine("}");
         writer.WriteLine();
+    }
+
+    /// <summary>
+    /// 返回语句里的表达式：C 侧返回类型与 C++ 实际返回值不一致时补显式转换。
+    /// </summary>
+    /// <remarks>
+    /// 强类型枚举（<c>enum class</c>）映射为 <c>int32_t</c>，C++ 不会隐式转换，必须 <c>static_cast</c>；
+    /// 其余标量与指针本就按原类型返回，不做多余转换（尤其不能把 <c>const T*</c> 强制转成 <c>T*</c>）。
+    /// </remarks>
+    private static string ReturnExpression(ShimFunctionInfo function, string call)
+    {
+        if (function.ReturnsEnum && function.ReturnCType is "int32_t")
+            return "static_cast<int32_t>(" + call + ")";
+
+        return call;
     }
 
     /// <summary>
@@ -1743,6 +1849,14 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
         /// 该导出是否需要写入 shim 头文件的声明。
         /// </summary>
         public bool NeedsDeclaration { get; init; } = true;
+
+        /// <summary>
+        /// 原生返回值是否为枚举：C 侧统一映射为 <c>int32_t</c>，C++ 侧需要显式转换。
+        /// </summary>
+        /// <remarks>
+        /// 必须在翻译单元存活期间计算并缓存；输出阶段 cursor 已失效。
+        /// </remarks>
+        public bool ReturnsEnum { get; init; }
     }
 
     /// <summary>
