@@ -66,6 +66,12 @@ public abstract class GenerationCommand
     [CliOption(Description = "可空句柄参数（Xxx? ↔ 原生 NULL）使用的自定义 marshaller 类型名")]
     public string NullableHandleMarshaller { get; set; } = "";
 
+    [CliOption(Description = "PCH 与实现文件的 #include 改写为相对 native 产物目录的形式，便于编译缓存跨机器复用；默认关闭")]
+    public bool RelativeIncludes { get; set; }
+
+    [CliOption(Description = "不输出中文进度信息；由 CMake 等以 ANSI 捕获输出的构建系统调用时可避免日志乱码。默认关闭")]
+    public bool Quiet { get; set; }
+
     /// <summary>
     /// <c>--</c> 之后原样传给 clang 的参数。
     /// </summary>
@@ -130,6 +136,8 @@ public abstract class GenerationCommand
             TargetName = NativeName,
             MaxExportsPerLibrary = MaxExportsPerLibrary,
             MaxExportsPerSource = MaxExportsPerSource,
+            RelativeIncludes = RelativeIncludes,
+            Quiet = Quiet,
         };
 
     /// <summary>
@@ -152,6 +160,7 @@ public abstract class GenerationCommand
             MethodsPerFile = MethodsPerFile,
             FourByteBoolean = FourByteBoolean,
             LibraryManifest = libraryManifest,
+            Quiet = Quiet,
         };
 
         if (StringMarshaller.Length is not 0)

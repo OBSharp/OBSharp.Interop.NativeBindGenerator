@@ -42,6 +42,8 @@ public class QtCommand : GenerationCommand
             TargetName = NativeName,
             MaxExportsPerLibrary = MaxExportsPerLibrary,
             MaxExportsPerSource = MaxExportsPerSource,
+            RelativeIncludes = RelativeIncludes,
+            Quiet = Quiet,
             ConnectionHandleTypeName = ConnectionTypeName,
             DisconnectFunctionName = DisconnectFunctionName,
             UseDeleteLater = UseDeleteLater,

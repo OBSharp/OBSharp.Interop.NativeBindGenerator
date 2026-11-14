@@ -68,4 +68,21 @@ public class CppShimGeneratorOptions
     /// <see cref="CBindingGenerator"/> 读取该清单，为每个函数生成指向正确库的 <c>LibraryImport</c>。
     /// </remarks>
     public string LibraryManifestFileName { get; set; } = "cpp_shim_libraries.txt";
+
+    /// <summary>
+    /// PCH 与实现文件 preamble 里的 <c>#include</c> 是否改写成相对 native 产物目录的形式。
+    /// </summary>
+    /// <remarks>
+    /// 默认写绝对路径；开启后换机或换目录不再改变头文件文本，便于 ccache/sccache 等编译缓存复用。
+    /// </remarks>
+    public bool RelativeIncludes { get; set; }
+
+    /// <summary>
+    /// 是否不输出进度信息。
+    /// </summary>
+    /// <remarks>
+    /// 进度信息是中文 UTF-8；CMake 3.20 的 <c>execute_process</c> 只能用 ANSI 捕获，
+    /// 下游构建日志会因此乱码，此时可开启本开关。
+    /// </remarks>
+    public bool Quiet { get; set; }
 }

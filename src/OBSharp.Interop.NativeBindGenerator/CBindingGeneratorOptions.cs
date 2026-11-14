@@ -162,4 +162,13 @@ public sealed class CBindingGeneratorOptions
     /// 阶段 2、阶段 3 每个生成文件最多包含的方法或属性数量，避免单个文件过大。
     /// </summary>
     public int MethodsPerFile { get; set; } = 128;
+
+    /// <summary>
+    /// 是否不输出进度信息（跳过提示与生成统计）。
+    /// </summary>
+    /// <remarks>
+    /// 进度信息是中文 UTF-8；由 CMake 等只能按 ANSI 捕获输出的构建系统调用时，
+    /// 开启本开关可避免日志乱码。真正的错误信息不受影响。
+    /// </remarks>
+    public bool Quiet { get; set; }
 }
