@@ -303,13 +303,21 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
     /// <remarks>
     /// 不能只靠 cursor kind：模板经常经 typedef/别名（如 <c>typedef QBasicAtomicInteger&lt;int&gt; QBasicAtomicInt;</c>）
     /// 或作为参数/字段类型被间接引用，到达这里的 kind 可能是 <c>StructDecl</c>。
-    /// 因此组合多个判据，任一命中即视为未实例化模板。
+    /// 因此组合多个判据，**任一命中即视为未实例化模板**；所有判据都不命中时也按模板处理
+    /// （宁可少导出，也不要产出编译不过的 C++ 代码）。
     /// </remarks>
     private static bool IsUninstantiatedTemplate(CXCursor declaration)
     {
         if (declaration.kind is CXCursorKind.CXCursor_ClassTemplate
             or CXCursorKind.CXCursor_ClassTemplatePartialSpecialization
             or CXCursorKind.CXCursor_TypeAliasTemplateDecl)
+        {
+            return true;
+        }
+
+        // 最直接的 AST 证据：模板声明会带 TemplateTypeParameter 子声明。
+        // 这比 kind 与拼写都可靠——Qt 的主模板在部分平移单元里会以 StructDecl 到达、拼写也无 `<`
+        if (HasTemplateTypeParameter(declaration))
             return true;
 
         // 模板实例必须能给出带参数列表的拼写；只有裸模板名说明没有实例化信息
@@ -335,9 +343,33 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
             parent = parent.SemanticParent;
         }
 
-        // 声明带特化标记 = 确实是某个模板的实例，不算未实例化
-        if (declaration.SpecializedCursorTemplate.IsNull is false && type.NumTemplateArguments is 0)
+        // 到这里仍无法证明它是模板：普通类型（非模板、非实例化）必须放行，
+        // 否则会把所有正常类都判成模板、导致导出全灭。只有能确认「与模板关联且无参数列表」时才拒绝
+        CXCursor specialized = declaration.SpecializedCursorTemplate;
+        if (specialized.IsNull)
             return false;
+
+        // SpecializedCursorTemplate 非空 = 与某个模板有关联（要么是模板本身，要么是特化/实例化）
+        return specialized.kind is CXCursorKind.CXCursor_ClassTemplate
+            or CXCursorKind.CXCursor_ClassTemplatePartialSpecialization;
+    }
+
+    /// <summary>
+    /// 声明第一层子节点里是否存在模板类型参数（<c>template &lt;typename T&gt;</c> 的标志）。
+    /// </summary>
+    private static bool HasTemplateTypeParameter(CXCursor declaration)
+    {
+        int count = declaration.NumChildren;
+        for (int i = 0; i < count; i++)
+        {
+            CXCursor child = declaration.GetChild((uint)i);
+            if (child.kind is CXCursorKind.CXCursor_TemplateTypeParameter
+                or CXCursorKind.CXCursor_TemplateTemplateParameter
+                or CXCursorKind.CXCursor_NonTypeTemplateParameter)
+            {
+                return true;
+            }
+        }
 
         return false;
     }
@@ -1398,36 +1430,101 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
     }
 
     /// <summary>
-    /// 写出前的自检：登记为句柄的类型不允许是未实例化的类模板。
+    /// 写出前的自检：直接扫描**待写出的文本**，不再依赖登记阶段的判定缓存。
     /// </summary>
     /// <remarks>
-    /// 这类缺陷曾经两次漏到下游（C2955/C2641）。与其交付编译不过的产物，不如让生成直接失败并指出类型名。
-    /// 判据只依赖 libclang 的 AST 信息（cursor kind、模板参数个数、拼写），不维护名字黑名单——
-    /// 逐个列举名字必然会随版本漏网，这正是前几轮的教训。
-    /// **注意**：判定结果必须在登记阶段缓存（<see cref="ShimTypeInfo.IsUninstantiatedTemplate"/>），
-    /// 输出阶段翻译单元已失效，直接访问 cursor 会崩溃。
+    /// 缓存判定曾经因为逻辑写反而整体失效（B5），因此这里的防线必须与判定无关：
+    /// 只要实际写出的 `.cpp` 里出现 <c>new 裸模板名()</c> 或 <c>reinterpret_cast&lt;裸模板名*&gt;</c>，
+    /// 就说明产物编译不过，直接让生成失败并列出类型名。
+    /// 判据仍只依赖 AST/文本本身，不维护名字黑名单——逐个列举必然随版本漏网。
     /// </remarks>
-    private void AssertNoBareTemplateNames()
+    private static void AssertNoBareTemplateNames(IEnumerable<GeneratedFile> files, HashSet<string> templateNames)
     {
-        List<string> offenders = [.. Types
-            .Where(type => type.IsUninstantiatedTemplate)
-            .Select(type => type.CppName)
-            .Distinct(StringComparer.Ordinal)
-            .OrderBy(name => name, StringComparer.Ordinal)];
+        if (templateNames.Count is 0)
+            return;
+
+        List<string> offenders = [];
+        foreach (GeneratedFile file in files)
+        {
+            if (file.Name.EndsWith(".cpp", StringComparison.Ordinal) is false)
+                continue;
+
+            foreach (string templateName in templateNames)
+            {
+                // 只关心「裸名」用法：名字后紧跟 ( 、* 或 ::，且不是带参数列表的合法实例化
+                if (ContainsBareNameUsage(file.Content, templateName)
+                    && offenders.Contains(templateName, StringComparer.Ordinal) is false)
+                {
+                    offenders.Add(templateName);
+                }
+            }
+        }
 
         if (offenders.Count is 0)
             return;
 
+        offenders.Sort(StringComparer.Ordinal);
         throw new InvalidOperationException(
             "生成的 shim 中出现了未实例化的类模板名，C++ 侧无法编译：" + string.Join(", ", offenders));
     }
 
+    /// <summary>
+    /// 文本中是否存在对 <paramref name="name"/> 的裸用法（不带模板参数列表）。
+    /// </summary>
+    /// <remarks>
+    /// 逐处定位名字出现位置，检查其后是否紧跟 <c>&lt;</c>：紧跟即合法实例化，跳过；
+    /// 否则再检查紧跟的是 <c>(</c>、<c>*</c> 或 <c>::</c> 才算裸用法（避免把注释、字符串或更长标识符误判）。
+    /// </remarks>
+    private static bool ContainsBareNameUsage(string content, string name)
+    {
+        int index = content.IndexOf(name, StringComparison.Ordinal);
+        while (index >= 0)
+        {
+            int after = index + name.Length;
+            bool startsLongerIdentifier = after < content.Length
+                && (char.IsLetterOrDigit(content[after]) || content[after] is '_');
+            bool hasTemplateArguments = after < content.Length && content[after] is '<';
+
+            if (startsLongerIdentifier is false && hasTemplateArguments is false && after < content.Length)
+            {
+                char next = content[after];
+                if (next is '(' or '*' or ':')
+                    return true;
+            }
+
+            index = content.IndexOf(name, index + 1, StringComparison.Ordinal);
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// 登记阶段识别出的未实例化模板名（C++ 侧拼写，不含模板参数）。
+    /// </summary>
+    /// <remarks>
+    /// 在翻译单元存活期间收集，供写出前的文本自检使用；不维护手写黑名单。
+    /// </remarks>
+    private HashSet<string> UninstantiatedTemplateNames()
+    {
+        HashSet<string> names = [with(StringComparer.Ordinal)];
+        foreach (ShimTypeInfo type in Types)
+        {
+            if (IsUninstantiatedTemplateByCache(type))
+                names.Add(type.CppName);
+        }
+
+        return names;
+    }
+
+    /// <summary>
+    /// 依据登记时缓存的判定结果（输出阶段不能访问 cursor）。
+    /// </summary>
+    private static bool IsUninstantiatedTemplateByCache(ShimTypeInfo type)
+        => type.IsUninstantiatedTemplate;
+
     protected virtual void WriteOutputs()
     {
         Directory.CreateDirectory(ShimOptions.Output.FullName);
-
-        // 写出前断言：绝不产出会在 C++ 侧编译失败的裸模板名（宁可生成失败，也不要静默交付坏产物）
-        AssertNoBareTemplateNames();
 
         string headerName = ShimOptions.BaseName + ".h";
         string pchName = ShimOptions.BaseName + ".pch.h";
@@ -1448,6 +1545,9 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
 
         // 导出符号 → 库名清单：CBindingGenerator 据此生成每个函数的 LibraryImport 库名
         Files.Add(new(ShimOptions.LibraryManifestFileName, BuildLibraryManifest(libraries)));
+
+        // 写出前断言：扫描实际输出文本中的已知模板名（名单来自 AST 判定，不维护手写黑名单）
+        AssertNoBareTemplateNames(Files, UninstantiatedTemplateNames());
 
         // 写正文，再释放嵌入的转换头文件，最后清理本轮未产出的旧产物
         foreach (GeneratedFile file in Files)
