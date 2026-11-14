@@ -485,3 +485,6 @@ $RECYCLE.BIN/
 
 # Vim temporary swap files
 *.swp
+
+# 构建时由 gitver（Shimakaze.GitSemVer）生成，不属于源码
+Directory.Version.props
