@@ -1086,7 +1086,7 @@ public class CppShimGenerator(CppShimGeneratorOptions options) : ClangCollector
     }
 
     /// <summary>
-    /// 统一的句柄前置声明块：先集中声明，再给已登记类型逐条附上原生类型注释。
+    /// 统一的句柄前置声明块：每个句柄名只声明一次，已登记类型额外附上原生类型注释。
     /// </summary>
     private void WriteHandleDeclarations(StringWriter writer)
     {
@@ -1094,14 +1094,23 @@ public class CppShimGenerator(CppShimGeneratorOptions options) : ClangCollector
             return;
 
         writer.WriteLine("// 句柄前置声明：所有被引用的不透明类型，避免在 extern \"C\" 下出现未知类型。");
-        foreach (string handle in HandleDeclarations.OrderBy(value => value, StringComparer.Ordinal))
-            writer.WriteLine("typedef struct " + handle + " " + handle + ";");
 
-        // 已登记类型再补一条原生类型注释，便于对照；同名句柄只在这里多出现一次注释行
+        // 已登记类型先按注释分组输出，保证「原生类型 → 句柄名」的对照信息仍在，且每个名字只声明一次
+        HashSet<string> written = [with(StringComparer.Ordinal)];
         foreach (ShimTypeInfo type in Types)
         {
+            if (!written.Add(type.HandleName))
+                continue;
+
             writer.WriteLine("// " + type.Keyword + " " + type.CppName);
             writer.WriteLine("typedef struct " + type.HandleName + " " + type.HandleName + ";");
+        }
+
+        // 其余只在参数/返回值里出现过的临时类型（嵌套类、模板实例等）没有成员导出，只补声明
+        foreach (string handle in HandleDeclarations.OrderBy(value => value, StringComparer.Ordinal))
+        {
+            if (written.Add(handle))
+                writer.WriteLine("typedef struct " + handle + " " + handle + ";");
         }
 
         writer.WriteLine();
