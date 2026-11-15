@@ -267,6 +267,13 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
         if (IsTypeVisible(declaration.Type) is false)
             return;
 
+        // 模板实例的实参必须能给出完整定义：只声明不定义的 *Private 类型作实参时，
+        // 该实例的构造函数（`d->ref.ref()`）与析构（`delete d`）都会报「使用了未定义类型」
+        // （C2027/C2338，QSharedDataPointer<QUrlQueryPrivate> 实测）。
+        // 这类实例只是内部实现细节，任何按值/按指针使用它的成员都要求实参完整，不能作为可构造句柄导出
+        if (HasIncompleteTemplateArgument(declaration.Type))
+            return;
+
         uint key = KeyOf(declaration);
         if (TypeByKey.ContainsKey(key))
             return;
@@ -286,6 +293,110 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
         TypeByKey.Add(key, type);
         Types.Add(type);
         HandleDeclarations.Add(type.HandleName);
+    }
+
+    /// <summary>
+    /// 类型（或它的模板实参）里是否含「只有前置声明」的记录类型。
+    /// </summary>
+    /// <remarks>
+    /// 无完整定义的记录类型可以单独作为不透明句柄使用，但作为**模板实参**时，模板一旦实例化就
+    /// 必然要求它完整（<c>QSharedDataPointer&lt;QUrlQueryPrivate&gt;</c> 的构造函数访问成员即 C2027）。
+    /// 只检查模板实参、不检查类型本身：类型本身没有定义是合法的不透明句柄（OBS 的绑定就依赖这种形态）。
+    /// </remarks>
+    private static bool HasIncompleteTemplateArgument(CXType type)
+    {
+        CXType canonical = Canonical(type);
+        int count = canonical.NumTemplateArguments;
+        for (int i = 0; i < count; i++)
+        {
+            CXType argument = Canonical(canonical.GetTemplateArgument((uint)i).AsType);
+
+            if (argument.kind is CXTypeKind.CXType_Record
+                && argument.Declaration.Definition.IsNull)
+            {
+                return true;
+            }
+
+            if (HasIncompleteTemplateArgument(argument))
+                return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// 函数是否按值使用了**只有前置声明**的记录类型。
+    /// </summary>
+    /// <remarks>
+    /// 不完整的记录类型可以合法地作为不透明句柄（指针）出现，但按值传参或返回都要复制对象，
+    /// 此时只能报「无法从 X 转换为 X」（qnetworkinterface.h 只前置声明了 QDeadlineTimer，
+    /// <c>QNetworkAddressEntry::setAddressLifetime</c> 实测 C2664）。
+    /// 完整性取决于本 TU 包含了哪些头文件，因此只能在发现阶段按当前 TU 判定：
+    /// 单模块生成的 TU 里缺定义就跳过，全模块生成时类型完整、导出照旧。
+    /// </remarks>
+    private static bool UsesIncompleteValueRecord(CXCursor declaration, ShimRole role)
+    {
+        if (role is not (ShimRole.New or ShimRole.Finalize)
+            && IsIncompleteValueRecord(declaration.ResultType))
+        {
+            return true;
+        }
+
+        int count = declaration.NumArguments;
+        for (int i = 0; i < count; i++)
+        {
+            if (IsIncompleteValueRecord(declaration.GetArgument((uint)i).Type))
+                return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// 类型是否就是「没有完整定义的记录类型」本身（指针/引用不算，它们只需要不透明句柄）。
+    /// </summary>
+    /// <remarks>
+    /// 只靠 <c>Declaration.Definition.IsNull</c> 会误伤模板实例及其内嵌类型：
+    /// libclang 对 <c>QHash&lt;QString, QVariant&gt;</c>、<c>QList&lt;QObject *&gt;::const_iterator</c>
+    /// 既不给出定义也不给出大小（<c>clang_Type_getSizeOf</c> 返回 -2），而它们在 C++ 侧由
+    /// 实例化产出、完整可用。因此先排除「自身带模板实参」与「模板实例的内嵌类型」，
+    /// 剩下的 null 定义才是真正的前置声明（如 <c>qnetworkinterface.h</c> 里的 <c>QDeadlineTimer</c>）。
+    /// </remarks>
+    private static bool IsIncompleteValueRecord(CXType type)
+    {
+        CXType shape = Canonical(type);
+        if (shape.kind is not CXTypeKind.CXType_Record)
+            return false;
+
+        if (shape.NumTemplateArguments > 0)
+            return false;
+
+        CXCursor declaration = shape.Declaration;
+        if (declaration.Definition.IsNull is false)
+            return false;
+
+        return IsNestedInTemplateInstance(declaration) is false;
+    }
+
+    /// <summary>
+    /// 声明是否嵌在类模板实例里（沿语义父级上溯，遇到命名空间/翻译单元即结束）。
+    /// </summary>
+    private static bool IsNestedInTemplateInstance(CXCursor declaration)
+    {
+        for (CXCursor parent = declaration.SemanticParent; parent.IsNull is false; parent = parent.SemanticParent)
+        {
+            if (parent.Type.NumTemplateArguments > 0)
+                return true;
+
+            if (parent.kind is CXCursorKind.CXCursor_Namespace
+                or CXCursorKind.CXCursor_TranslationUnit
+                or CXCursorKind.CXCursor_LinkageSpec)
+            {
+                return false;
+            }
+        }
+
+        return false;
     }
 
     protected static string RecordKeyword(CXCursorKind kind)
@@ -573,6 +684,9 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
             if (IsSupportedReturn(ctor.ResultType) is false && ctor.ResultType.kind is not CXTypeKind.CXType_Void)
                 continue;
 
+            if (RequiresDefaultConstructibleElement(type, ctor))
+                continue;
+
             AddFunction(type, ctor, ShimRole.New, type.SymbolPrefix + "_new");
             hasExplicit = true;
         }
@@ -841,11 +955,77 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
             if (method.CXXMethod_IsVirtual)
                 continue;
 
+            if (RequiresDefaultConstructibleElement(type, method))
+                continue;
+
             if (IsSupportedReturn(method.ResultType) is false)
                 continue;
 
             AddFunction(type, method, ShimRole.Method, type.SymbolPrefix + "_" + ToIdentifier(method.Spelling.ToString()));
         }
+    }
+
+    /// <summary>
+    /// 模板实例的这个成员/构造是否属于「只给数量、不给初值」的操作——要求元素类型可默认构造。
+    /// </summary>
+    /// <remarks>
+    /// Qt 容器在扩容路径上按值构造元素：<c>QList&lt;T&gt;::reserve</c> 走
+    /// <c>DataPointer(newSize)</c>，<c>resize(n)</c> 走 <c>appendInitialize</c>，
+    /// <c>resizeForOverwrite(n)</c> 走 <c>appendUninitialized</c>，<c>QList&lt;T&gt;(n)</c>
+    /// 同样会 <c>appendInitialize</c>，最终都落到 <c>std::uninitialized_default_construct</c>，
+    /// 元素没有默认构造时报 C2512/C2672（xutility）。
+    /// 这类成员与该不该导出无关——**调用即实例化**，元素类型不可默认构造时只能不生成。
+    /// 判定依据是「会按值铺开 n 个空槽」这一操作语义，加上实参类型的默认构造能力，
+    /// 不按宿主类型名判断；带初值的 <c>resize(n, value)</c> 逐元素拷贝，不受影响。
+    /// </remarks>
+    private static bool RequiresDefaultConstructibleElement(ShimTypeInfo type, CXCursor member)
+    {
+        // 「数量型」签名本身不足以定位：`removeAt(n)` / `remove(n)` / `clear()` 同样只接数量，
+        // 但它们只会搬移或析构既有元素，不构造新元素。真正铺开空槽的只有构造与这三个扩容入口，
+        // 其余数量型操作一律放过，避免误删可编译的导出（QList::removeAt 实测）。
+        if (member.kind is not CXCursorKind.CXCursor_Constructor
+            && member.Spelling.ToString() is not ("reserve" or "resize" or "resizeForOverwrite"))
+        {
+            return false;
+        }
+
+        // 只给数量、不给初值：恰好一个参数，且是整型（qsizetype 剥壳后是整数类型）
+        if (member.NumArguments is not 1)
+            return false;
+
+        CXType countType = Canonical(member.GetArgument(0).Type);
+        switch (countType.kind)
+        {
+            case CXTypeKind.CXType_Short
+                or CXTypeKind.CXType_UShort
+                or CXTypeKind.CXType_Int
+                or CXTypeKind.CXType_UInt
+                or CXTypeKind.CXType_Long
+                or CXTypeKind.CXType_ULong
+                or CXTypeKind.CXType_LongLong
+                or CXTypeKind.CXType_ULongLong:
+                break;
+            default:
+                return false;
+        }
+
+        // 必须返回 void：带返回值的数量型查询（at/indexOf 等）不构造元素
+        if (Canonical(member.ResultType).kind is not CXTypeKind.CXType_Void)
+            return false;
+
+        CXType instance = type.Declaration.Type;
+        int count = instance.NumTemplateArguments;
+        for (int i = 0; i < count; i++)
+        {
+            CXType argument = Canonical(instance.GetTemplateArgument((uint)i).AsType);
+            if (argument.kind is CXTypeKind.CXType_Record
+                && IsDefaultConstructible(argument) is false)
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /// <summary>
@@ -1011,6 +1191,59 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
             || name.Contains("call_reportfault", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>
+    /// 自由函数是函数模板的显式特化时，拼出调用处必须写出的模板实参。
+    /// </summary>
+    /// <remarks>
+    /// <c>template &lt;int Size&gt; void *qbswap(const void *, qsizetype, void *)</c> 的 <c>Size</c>
+    /// 只出现在模板实参表里，无法从形参推导：写成 <c>qbswap(a, b, c)</c> 会报
+    /// 「没有重载函数接受 3 个参数」（C2661）。libclang 在特化游标上直接给出模板实参，
+    /// 按 <c>&lt;实参&gt;</c> 拼回调用即可。
+    /// 实参无法表达（依赖表达式、包展开、模板模板参数等）时返回 <c>false</c>：
+    /// 调用方必须放弃该导出，否则必然产出编译不过的代码。
+    /// </remarks>
+    private static bool TryBuildTemplateArgumentSuffix(CXCursor declaration, out string? suffix)
+    {
+        suffix = null;
+
+        CXCursor specialized = declaration.SpecializedCursorTemplate;
+        if (specialized.IsNull || specialized.kind is not CXCursorKind.CXCursor_FunctionTemplate)
+            return true;
+
+        int count = declaration.NumTemplateArguments;
+        if (count <= 0)
+            return false;
+
+        List<string> arguments = [];
+        for (int i = 0; i < count; i++)
+        {
+            CX_TemplateArgument argument = declaration.GetTemplateArgument((uint)i);
+            switch (argument.kind)
+            {
+                case CXTemplateArgumentKind.CXTemplateArgumentKind_Integral:
+                case CXTemplateArgumentKind.CXTemplateArgumentKind_Expression:
+                    arguments.Add(argument.AsIntegral.ToString(CultureInfo.InvariantCulture));
+                    break;
+
+                case CXTemplateArgumentKind.CXTemplateArgumentKind_Type:
+                    {
+                        string spelling = argument.AsType.Spelling.ToString();
+                        if (spelling.Length is 0)
+                            return false;
+
+                        arguments.Add(spelling);
+                        break;
+                    }
+
+                default:
+                    return false;
+            }
+        }
+
+        suffix = "<" + string.Join(", ", arguments) + ">";
+        return true;
+    }
+
+    /// <summary>
     /// 记录一个导出项，并按参数类型生成唯一符号名。
     /// </summary>
     /// <remarks>
@@ -1029,6 +1262,13 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
         if (parameters.Any(parameter => parameter.CType is null))
             return;
 
+        // 按值使用的记录类型必须在**本翻译单元内**有完整定义：只前置声明的类型可以合法地作为
+        // 不透明句柄（指针）出现，但按值传参/返回都要复制对象，C++ 侧只能报「无法从 X 转换为 X」
+        // （qnetworkinterface.h 只前置声明了 QDeadlineTimer，QNetworkAddressEntry::setAddressLifetime
+        // 实测 C2664）。完整性取决于本 TU 包含了哪些头文件，因此只能在发现阶段按当前 TU 判定。
+        if (UsesIncompleteValueRecord(declaration, role))
+            return;
+
         string symbol = UniqueSymbol(BuildSymbol(baseName, parameters));
 
         // 按值返回的不可绑定记录类型不能映射成 cpp_shim_X*：C++ 侧 return 的是值本身，
@@ -1043,15 +1283,40 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
             ShimRole.Finalize => "void",
             _ => ReturnCType(declaration.ResultType, handleFallback: null) ?? "void",
         };
-        bool returnsVoid = role is ShimRole.Finalize
-            || Canonical(declaration.ResultType).kind is CXTypeKind.CXType_Void;
+        // 是否为空返回必须以**最终 C 侧返回类型**为准，不能另看原生类型：
+        // 两者不同源时函数体会走 `return <expr>;`，而 C 侧声明是 void（C2562，QMap::firstKey 实测）
+        bool returnsVoid = returnCType is "void";
         bool returnsEnum = role is not (ShimRole.New or ShimRole.Finalize)
             && Canonical(declaration.ResultType).kind is CXTypeKind.CXType_Enum;
+
+        // char16_t*/char32_t* 在 C 侧是 uint16_t*/uint32_t*：目标类型不同的两个指针互不兼容，
+        // 返回时必须显式转换（QStringDecoder::appendToBuffer 实测 C2440）
+        bool returnsWideCharPointer = role is not (ShimRole.New or ShimRole.Finalize)
+            && Canonical(declaration.ResultType) is { kind: CXTypeKind.CXType_Pointer } resultPointer
+            && Canonical(resultPointer.PointeeType).kind
+                is CXTypeKind.CXType_Char16 or CXTypeKind.CXType_Char32;
 
         // 返回位一致性校验：C 侧返回类型必须能承接 C++ 的实际返回值。
         // 不满足就不生成该导出——宁可少一个绑定，也不要产出编译不过的产物（C2440）
         if (role is not (ShimRole.New or ShimRole.Finalize)
             && IsInconsistentReturn(declaration.ResultType, returnCType))
+        {
+            return;
+        }
+
+        // 自由函数若是函数模板的显式特化，调用处必须显式写出模板实参
+        string? templateSuffix = null;
+        if (role is ShimRole.Free
+            && TryBuildTemplateArgumentSuffix(declaration, out templateSuffix) is false)
+        {
+            return;
+        }
+
+        // 原生返回非 void、C 侧却映射不出返回类型（退化成 void）时整条不生成：
+        // 这种导出既拿不到返回值，又会让函数体写成「void 函数却 return 了值」
+        if (returnsVoid
+            && role is not (ShimRole.New or ShimRole.Finalize)
+            && Canonical(declaration.ResultType).kind is not CXTypeKind.CXType_Void)
         {
             return;
         }
@@ -1069,6 +1334,7 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
                 null)
             {
                 ReturnsEnum = returnsEnum,
+                ReturnsWideCharPointer = returnsWideCharPointer,
             },
             ShimRole.Free => new(
                 owner,
@@ -1081,6 +1347,8 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
                 QualifiedName(declaration))
             {
                 ReturnsEnum = returnsEnum,
+                ReturnsWideCharPointer = returnsWideCharPointer,
+                TemplateArgumentSuffix = templateSuffix,
             },
             _ => new(owner, role, parameters, symbol, returnCType, null, returnsVoid, null),
         };
@@ -1107,15 +1375,59 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
     }
 
     /// <summary>
+    /// 记录类型能否被拷贝构造：显式删除或不可访问的拷贝构造都算不可拷贝。
+    /// </summary>
+    /// <remarks>
+    /// 只移类型（<c>std::unique_ptr&lt;QAbstractVideoBuffer&gt;</c>）按值传参时，解引用得到的是左值，
+    /// C++ 会去调**已删除**的拷贝构造（C2280），必须由调用方显式转成右值来触发移动。
+    /// 没有完整定义的记录不做判断：完整性由 <see cref="IsIncompleteValueRecord"/> 在别处拦截。
+    /// </remarks>
+    private static bool IsCopyConstructible(CXType type)
+    {
+        CXType shape = Canonical(type);
+        if (shape.kind is not CXTypeKind.CXType_Record)
+            return true;
+
+        CXCursor definition = shape.Declaration.Definition;
+        if (definition.IsNull)
+            return true;
+
+        int count = definition.NumCtors;
+        for (int i = 0; i < count; i++)
+        {
+            CXCursor ctor = definition.GetCtor((uint)i);
+            if (ctor.CXXConstructor_IsCopyConstructor is false)
+                continue;
+
+            if (ctor.IsDeleted)
+                return false;
+
+            return ctor.CXXAccessSpecifier is CX_CXXAccessSpecifier.CX_CXXPublic
+                or CX_CXXAccessSpecifier.CX_CXXInvalidAccessSpecifier;
+        }
+
+        // 没有声明拷贝构造时编译器会生成隐式版本
+        return true;
+    }
+
+    /// <summary>
     /// 把 C 形参还原成 C++ 调用实参的默认表达式；派生类可覆盖以插入框架特有的转换。
     /// </summary>
     protected virtual string BuildToCppExpression(string name, CXType canonical, string cType, string cppType)
         => canonical.kind switch
         {
-            CXTypeKind.CXType_LValueReference or CXTypeKind.CXType_RValueReference
+            CXTypeKind.CXType_LValueReference
                 => "*reinterpret_cast<" + cppType + "*>(" + name + ")",
+            // 右值引用形参不能由左值实参绑定（explicit QString(DataPointer&&) 实测 C2665）：
+            // 解引用得到左值，必须显式转回右值引用
+            CXTypeKind.CXType_RValueReference
+                => "static_cast<" + cppType + "&&>(*reinterpret_cast<" + cppType + "*>(" + name + "))",
             CXTypeKind.CXType_Record
-                => "*reinterpret_cast<" + cppType + "*>(" + name + ")",
+                => IsCopyConstructible(canonical)
+                    ? "*reinterpret_cast<" + cppType + "*>(" + name + ")"
+                    // 不可拷贝的记录（std::unique_ptr 等只移类型）按值传参时必须显式转成右值，
+                    // 否则解引用得到左值，C++ 去调**已删除**的拷贝构造（QVideoFrame 实测 C2280）
+                    : "static_cast<" + cppType + "&&>(*reinterpret_cast<" + cppType + "*>(" + name + "))",
             CXTypeKind.CXType_Enum
                 => "static_cast<" + cppType + ">(" + name + ")",
             // 指针形参的 cppType 已包含完整指针层级，这里原样强转，不能再补 *
@@ -1139,6 +1451,10 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
             CXTypeKind.CXType_Bool => "bool",
             // C 侧 char 映射为 char，C++ 还原时同样用 char，避免与只接受 char* 的接口不兼容
             CXTypeKind.CXType_Char_S or CXTypeKind.CXType_Char_U => "char",
+            // char16_t/char32_t 是定宽字符类型，C 侧映射成 uint16_t/uint32_t；
+            // 这里缺映射会让还原表达式退化成 int*（QStringDecoder::appendToBuffer 实测 C2665）
+            CXTypeKind.CXType_Char16 => "char16_t",
+            CXTypeKind.CXType_Char32 => "char32_t",
             CXTypeKind.CXType_SChar => "signed char",
             CXTypeKind.CXType_UChar => "unsigned char",
             CXTypeKind.CXType_Short => "short",
@@ -1580,7 +1896,7 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
     /// <summary>
     /// 剥掉引用限定（引用指向的目标类型）。
     /// </summary>
-    private static CXType PeelReference(CXType type)
+    protected static CXType PeelReference(CXType type)
     {
         CXType current = type;
         for (int guard = 0; guard < 8; guard++)
@@ -2380,7 +2696,8 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
 
             default:
                 {
-                    string call = function.FreeQualifiedName + "(" + ArgumentList(function) + ")";
+                    string call = function.FreeQualifiedName + function.TemplateArgumentSuffix
+                        + "(" + ArgumentList(function) + ")";
                     writer.WriteLine("    return " + ReturnExpression(function, call) + ";");
                     break;
                 }
@@ -2496,6 +2813,10 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
     {
         if (function.ReturnsEnum && function.ReturnCType is "int32_t")
             return "static_cast<int32_t>(" + call + ")";
+
+        // 宽字符指针：C 侧是定宽无符号整型指针，与 C++ 的 char16_t*/char32_t* 不兼容
+        if (function.ReturnsWideCharPointer)
+            return "reinterpret_cast<" + function.ReturnCType + ">(" + call + ")";
 
         return call;
     }
@@ -2777,6 +3098,25 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
         /// 必须在翻译单元存活期间计算并缓存；输出阶段 cursor 已失效。
         /// </remarks>
         public bool ReturnsEnum { get; init; }
+
+        /// <summary>
+        /// 原生返回 <c>char16_t*</c>/<c>char32_t*</c>：C 侧对应 <c>uint16_t*</c>/<c>uint32_t*</c>，
+        /// 指针目标类型不同，返回时必须显式 <c>reinterpret_cast</c>。
+        /// </summary>
+        /// <remarks>
+        /// 必须在翻译单元存活期间计算并缓存；输出阶段 cursor 已失效。
+        /// </remarks>
+        public bool ReturnsWideCharPointer { get; init; }
+
+        /// <summary>
+        /// 函数模板显式特化的模板实参文本（如 <c>&lt;2&gt;</c>），拼在调用里的函数名之后。
+        /// </summary>
+        /// <remarks>
+        /// 特化的模板实参不一定能从形参推导（<c>qbswap</c> 的 <c>Size</c> 只出现在模板实参表里），
+        /// 省略就会因为推导失败而报「没有重载函数接受 N 个参数」（C2661）。
+        /// 必须在翻译单元存活期间取出；输出阶段 cursor 已失效。
+        /// </remarks>
+        public string? TemplateArgumentSuffix { get; init; }
     }
 
     /// <summary>
