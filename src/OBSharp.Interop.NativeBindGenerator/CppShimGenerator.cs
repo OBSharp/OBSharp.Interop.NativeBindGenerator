@@ -33,6 +33,11 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
     private readonly Dictionary<string, string[]> _sourceLines = [];
 
     /// <summary>
+    /// 被绑定框架头文件的公共目录，用于把框架头与真正的系统头区分开。
+    /// </summary>
+    private string? _frameworkRoot;
+
+    /// <summary>
     /// 头文件里实际引用到的全部句柄类型名：已登记类型与临时换算类型都在此登记，按名字去重。
     /// </summary>
     protected HashSet<string> HandleDeclarations { get; } = [with(StringComparer.Ordinal)];
@@ -252,6 +257,11 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
     private void AddType(CXCursor declaration)
     {
         if (declaration.IsAnonymous || declaration.Spelling.ToString().Length is 0)
+            return;
+
+        // 系统头/编译器内建头里的类型不是框架接口：把 `union wait`（sys/wait.h）、
+        // `__tile1024i_str`（clang 内建头）当成可构造句柄会生成编译不过的 new/delete
+        if (IsSystemHeaderDeclaration(declaration) || IsReservedTypeName(declaration))
             return;
 
         if (IsAccessible(declaration) is false)
@@ -1097,13 +1107,21 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
     /// 判据用路径特征而非文件名清单：<c>VC\Tools\MSVC\...\include</c>、<c>include/msvc</c>、
     /// <c>/usr/include</c>、<c>/usr/lib/&lt;triple&gt;/include</c>、<c>Windows Kits</c> 等。
     /// 只要声明来自这些根，就不把它的自由函数当作可绑定接口。
+    /// 框架头优先：Linux 发行版的 Qt 装在 <c>/usr/include/&lt;triple&gt;/qt6</c>，
+    /// 会被路径特征误判成系统头，必须先用框架头公共根排除。
     /// </remarks>
-    private static bool IsSystemHeaderDeclaration(CXCursor declaration)
+    private bool IsSystemHeaderDeclaration(CXCursor declaration)
     {
         declaration.Location.GetExpansionLocation(out CXFile file, out _, out _, out _);
         string path = file.Name.ToString().Replace('\\', '/');
         if (path.Length is 0)
             return false;
+
+        if (FrameworkRoot is { Length: not 0 } root
+            && path.StartsWith(root, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
 
         foreach (string marker in SystemHeaderMarkers)
         {
@@ -1112,6 +1130,54 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
         }
 
         return false;
+    }
+
+    /// <summary>
+    /// 被绑定头文件目录树的公共根，形如 <c>E:/.../include/</c>。
+    /// </summary>
+    private string? FrameworkRoot => _frameworkRoot ??= ComputeFrameworkRoot();
+
+    private string? ComputeFrameworkRoot()
+    {
+        List<string[]> segments = [];
+        foreach (string header in ShimOptions.Headers)
+        {
+            string? directory = Path.GetDirectoryName(Path.GetFullPath(header));
+            if (directory is null)
+                continue;
+
+            segments.Add(directory.Replace('\\', '/').Split('/', StringSplitOptions.RemoveEmptyEntries));
+        }
+
+        if (segments.Count is 0)
+            return null;
+
+        // Windows 路径比较不区分大小写，其余平台按字节比较
+        StringComparison comparison = OperatingSystem.IsWindows()
+            ? StringComparison.OrdinalIgnoreCase
+            : StringComparison.Ordinal;
+        int shortest = segments.Min(segment => segment.Length);
+        List<string> common = [];
+        for (int i = 0; i < shortest; i++)
+        {
+            string current = segments[0][i];
+            if (segments.Any(segment => segment[i].Equals(current, comparison) is false))
+                break;
+
+            common.Add(current);
+        }
+
+        if (common.Count is 0)
+            return null;
+
+        // 路径太浅（盘符根、/usr、/home 之类）说明头文件不在同一棵框架树里，
+        // 用它排除系统头会把真正的系统头一起放过，宁可不排除
+        if (common.Count < 2)
+            return null;
+
+        // Windows 的盘符（E:）是路径首段，拼接时不能再加前导斜杠
+        string joined = string.Join('/', common);
+        return common[0].EndsWith(':') ? joined + "/" : "/" + joined + "/";
     }
 
     /// <summary>
@@ -1126,7 +1192,20 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
         "/usr/lib/",
         "/Library/Developer/",
         "/opt/homebrew/",
+        // clang 自带内建头（__clang_cuda_*、__clang_hip_* 等）与 C++ 标准库头
+        "/lib/clang/",
+        "/include/c++/",
+        "/c++/v1/",
+        "/usr/local/include/",
     ];
+
+    /// <summary>
+    /// 类型名是否含编译器/标准库保留标识符（任一段以双下划线开头，如 <c>__tile1024i_str</c>）。
+    /// </summary>
+    private static bool IsReservedTypeName(CXCursor declaration)
+        => QualifiedName(declaration)
+            .Split("::", StringSplitOptions.RemoveEmptyEntries)
+            .Any(segment => segment.StartsWith("__", StringComparison.Ordinal));
 
     /// <summary>
     /// Qt 工具函数名：<c>q</c> 前缀的宏/内联函数族与 <c>qt_</c> 内部命名空间族。
