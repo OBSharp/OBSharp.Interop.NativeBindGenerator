@@ -33,6 +33,14 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
     private readonly Dictionary<string, string[]> _sourceLines = [];
 
     /// <summary>
+    /// 类型发现阶段使用的翻译单元：判断导出宏需要 token 化声明前缀。
+    /// </summary>
+    /// <remarks>
+    /// 只在发现阶段有效，<see cref="Generate"/> 释放翻译单元前必须清空，避免后续误用失效句柄。
+    /// </remarks>
+    private CXTranslationUnit _unit;
+
+    /// <summary>
     /// 被绑定框架头文件的公共目录，用于把框架头与真正的系统头区分开。
     /// </summary>
     private string? _frameworkRoot;
@@ -80,12 +88,14 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
                         throw new InvalidOperationException("clang 解析头文件时出现错误，已中止生成");
 
                     // cursor 的生命周期绑定在翻译单元上，发现必须在其释放前完成
+                    _unit = unit;
                     List<CXCursor> declarations = CollectTopLevel(unit);
                     DiscoverTypes(declarations);
                     DiscoverMembers(declarations);
                 }
                 finally
                 {
+                    _unit = default;
                     unit.Dispose();
                 }
             }
@@ -298,6 +308,9 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
         {
             // 翻译单元存活期间判定并缓存，供输出阶段的自检使用
             IsUninstantiatedTemplate = IsUninstantiatedTemplate(declaration),
+            // 类声明链上没有 Qt 导出宏的类型，成员只有声明没有定义时不能导出（链接必然失败）。
+            // 先看到前置声明、后看到定义的顺序很常见，两处都要看
+            IsExported = HasExportMacro(declaration) || IsDefinitionExported(declaration),
         };
 
         TypeByKey.Add(key, type);
@@ -709,7 +722,81 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
         if (!CanConstructDefault(definition))
             return;
 
+        // 非导出类型里，报告出来的构造函数必须要么在本翻译单元内有定义、要么自带导出宏、
+        // 要么所属类本身就是按成员导出的（宏生成的成员看不到宏体里的导出宏）：
+        // 否则补出来的 `new X()` 无法链接（QOpenGLVersionFunctionsStorage 的 ctor 只有声明，
+        // 且被 libclang 报成 implicit，SkipMember 拦不住）；
+        // 没有报告构造函数时才是编译器生成的隐式默认构造。模板实例按需实例化，不适用该判据
+        if (type.IsExported is false
+            && type.Declaration.SpecializedCursorTemplate.IsNull
+            && IsNestedInTemplateInstance(type.Declaration) is false
+            && !HasConstructibleCtor(definition, count))
+        {
+            return;
+        }
+
         AddSynthetic(type, ShimRole.New, type.SymbolPrefix + "_new");
+    }
+
+    /// <summary>
+    /// 类型的构造是否可安全地合成：每个报告的构造函数要么在本翻译单元内有定义，
+    /// 要么带导出宏，要么所属类本身按成员导出。
+    /// </summary>
+    /// <remarks>
+    /// <c>QT_PERMISSION</c> 这类宏生成的构造函数，名字的拼写位置落在宏**调用**处，
+    /// 看不到宏体里的 <c>Q_CORE_EXPORT</c>；但同类里其他成员（<c>setAccessMode</c>）
+    /// 直接带导出宏，足以证明该类的接口是按成员导出的。
+    /// </remarks>
+    private bool HasConstructibleCtor(CXCursor definition, int count)
+    {
+        bool blocked = false;
+        for (int i = 0; i < count; i++)
+        {
+            CXCursor ctor = definition.GetCtor((uint)i);
+            if (ctor.Definition.IsNull && HasExportMacro(ctor) is false)
+                blocked = true;
+        }
+
+        // 有构造函数看不到定义也没有自己的导出宏时，只有「类按成员导出」才能保证链接得到
+        return blocked is false || HasExportedMemberType(definition);
+    }
+
+    /// <summary>
+    /// 类型定义里是否有直接带导出宏的成员（含构造函数与析构函数）。
+    /// </summary>
+    private bool HasExportedMemberType(CXCursor definition)
+        => definition.IsNull is false && HasExportedMember(definition);
+
+    /// <summary>
+    /// 类型定义里是否有直接带导出宏的成员。
+    /// </summary>
+    private bool HasExportedMember(CXCursor definition)
+    {
+        DeclarationCollector collector = new();
+        GCHandle handle = GCHandle.Alloc(collector);
+        try
+        {
+            unsafe
+            {
+                definition.VisitChildren(&MemberVisitor, new CXClientData((nint)handle));
+            }
+        }
+        finally
+        {
+            handle.Free();
+        }
+
+        return collector.Results.Any(member => HasExportMacro(member));
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static unsafe CXChildVisitResult MemberVisitor(CXCursor cursor, CXCursor parent, void* clientData)
+    {
+        if (GCHandle.FromIntPtr((nint)clientData).Target is not DeclarationCollector collector)
+            return CXChildVisitResult.CXChildVisit_Break;
+
+        collector.Results.Add(cursor);
+        return CXChildVisitResult.CXChildVisit_Continue;
     }
 
     /// <summary>
@@ -1208,6 +1295,65 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
             .Any(segment => segment.StartsWith("__", StringComparison.Ordinal));
 
     /// <summary>
+    /// 声明前缀（从名字所在行的行首到名字）里是否出现导出宏。
+    /// </summary>
+    /// <remarks>
+    /// 用 token 而非源码文本：宏在源码里就是普通标识符，token 化能同时覆盖
+    /// <c>Q_CORE_EXPORT</c>、<c>QDESIGNER_SDK_EXPORT</c>、<c>Q_UITOOLS_EXPORT</c> 等全部形式，
+    /// 也不必按名字枚举受导出控制的具体类。
+    /// 起点取「名字拼写位置所在行的行首」而不是声明起点：<c>Q_GUI_EXPORT</c> 会展开成
+    /// <c>__declspec</c>，以宏展开位置为起点 token 化会得到空结果（QPolygon::translate 实测）；
+    /// 由宏生成的成员（<c>QT_PERMISSION</c> 里的析构）名字则写在宏定义里，只有按拼写位置回读才看得到宏。
+    /// </remarks>
+    private bool HasExportMacro(CXCursor declaration)
+    {
+        // 翻译单元已释放（或未经发现阶段）时无法判定，按「有导出宏」处理，避免误删导出
+        if (_unit.Handle == IntPtr.Zero)
+            return true;
+
+        CXSourceRange nameRange = clang.Cursor_getSpellingNameRange(declaration, 0, 0);
+        if (nameRange.IsNull)
+            return false;
+
+        nameRange.Start.GetFileLocation(out CXFile file, out uint line, out _, out _);
+        if (line is 0)
+            return false;
+
+        CXSourceRange scan = clang.getRange(_unit.GetLocation(file, line, 1), nameRange.Start);
+        if (scan.IsNull)
+            return false;
+
+        Span<CXToken> tokens = _unit.Tokenize(scan);
+        try
+        {
+            foreach (CXToken token in tokens)
+            {
+                using CXString spelling = token.GetSpelling(_unit);
+                if (ExportMacroRegex().IsMatch(spelling.CString))
+                    return true;
+            }
+        }
+        finally
+        {
+            _unit.DisposeTokens(tokens);
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// 类型定义的声明前缀里是否出现导出宏；没有独立定义时返回 <c>false</c>。
+    /// </summary>
+    private bool IsDefinitionExported(CXCursor declaration)
+    {
+        CXCursor definition = declaration.Definition;
+        return definition.IsNull is false && definition.Equals(declaration) is false && HasExportMacro(definition);
+    }
+
+    [GeneratedRegex(@"^[A-Z][A-Z0-9_]*_(EXPORT|IMPORT)$", RegexOptions.CultureInvariant)]
+    private static partial Regex ExportMacroRegex();
+
+    /// <summary>
     /// Qt 工具函数名：<c>q</c> 前缀的宏/内联函数族与 <c>qt_</c> 内部命名空间族。
     /// </summary>
     /// <remarks>
@@ -1333,6 +1479,25 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
     /// </remarks>
     protected virtual void AddFunction(ShimTypeInfo? owner, CXCursor declaration, ShimRole role, string baseName)
     {
+        // 类上没有导出宏、成员又只有声明没有定义时，符号虽然存在于库里但没有导出：
+        // 生成出来必然 unresolved external（QRangeModelImplBase、QPropertyBindingPrivatePtr、
+        // QOpenGLVersionFunctionsStorage 实测 18 条 LNK2019）。模板实例的定义按需在头文件里
+        // 实例化，不适用该判据。
+        // 这里必须看「本翻译单元内是否存在定义」而不是当前 cursor 是不是定义：
+        // Qt 常把成员声明在类里、inline 定义在另一个头文件里（QStringView::compare 在 qstring.h）
+        if (owner is { IsExported: false }
+            && declaration.Definition.IsNull
+            && HasExportMacro(declaration) is false
+            // 宏生成的构造/析构（QT_PERMISSION 等）看不到宏体里的导出宏；
+            // 同类若有直接带导出宏的成员，说明该类的接口是按成员导出的
+            && (role is not (ShimRole.New or ShimRole.Finalize)
+                || HasExportedMemberType(owner.Declaration.Definition) is false)
+            && owner.Declaration.SpecializedCursorTemplate.IsNull
+            && IsNestedInTemplateInstance(owner.Declaration) is false)
+        {
+            return;
+        }
+
         List<ShimParameterInfo> parameters = [];
         int argumentCount = declaration.NumArguments;
         for (int i = 0; i < argumentCount; i++)
@@ -3135,6 +3300,15 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
         /// 必须在翻译单元存活期间计算并缓存；输出阶段访问 cursor 会导致崩溃。
         /// </remarks>
         public bool IsUninstantiatedTemplate { get; set; }
+
+        /// <summary>
+        /// 类型声明链上是否带 Qt 导出宏（<c>Q_CORE_EXPORT</c> 之类）。
+        /// </summary>
+        /// <remarks>
+        /// 必须在翻译单元存活期间计算并缓存；输出阶段 cursor 已失效。
+        /// 没有导出宏的类型，其成员只能导出在头文件里有定义的那些。
+        /// </remarks>
+        public bool IsExported { get; set; }
     }
 
     /// <summary>
