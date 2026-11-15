@@ -287,18 +287,19 @@ public sealed partial class QTShimGenerator(QTShimGeneratorOptions options) : Cp
             if (parameter.CType is null)
                 return;
 
+            bool byValue = IsCopyableSignalParameter(argument);
             parameters.Add(parameter);
             cppTypes.Add(CppTypeOf(Canonical(argument.Type)));
 
             // 按值传参的 lambda 形参会触发拷贝构造 + 析构；若该类型的析构不可访问
             // （QSessionManager 的析构是 private），连接表达式会引用私有析构（C2248）。
             // 这类参数改用 const 引用传递，不构造也不析构
-            lambdaParameters.Add(IsCopyableSignalParameter(argument)
-                ? cppTypes[i] + " p" + i.ToString(CultureInfo.InvariantCulture)
+            lambdaParameters.Add(byValue
+                ? SignalLambdaParameter(argument, cppTypes[i]) + " p" + i.ToString(CultureInfo.InvariantCulture)
                 : "const " + cppTypes[i] + "& p" + i.ToString(CultureInfo.InvariantCulture));
             // 回调实参必须与 C 形参**同源**：形参是 void* / 句柄指针时，实参也要是同一层级的指针，
             // 否则按值对象接不进 void*（C2664）；已是指针的实参不能再取一次地址
-            lambdaArguments.Add(SignalArgument(argument, parameter, i));
+            lambdaArguments.Add(SignalArgument(argument, parameter, !byValue, cppTypes[i], i));
         }
 
         string callbackName = UniqueSymbol(type.SymbolPrefix + "_" + snake + "_callback");
@@ -319,31 +320,51 @@ public sealed partial class QTShimGenerator(QTShimGeneratorOptions options) : Cp
     }
 
     /// <summary>
-    /// 信号形参能否按值传递：记录类型的析构必须可访问，否则 lambda 按值接参会在表达式里引用私有析构。
+    /// 按值接参的 lambda 形参类型文本：指针目标的 <c>const</c> 必须与信号声明一致。
     /// </summary>
     /// <remarks>
-    /// 非记录类型（标量、指针）按值传递不涉及析构，一律允许。
+    /// <see cref="CppShimGenerator.CppTypeOf"/> 拼指针时用剥壳后的目标类型，而展开
+    /// <c>CXType_Elaborated</c> 取的是 <c>NamedType</c>（<c>clang_Type_getNamedType</c>
+    /// 返回的记录类型不带限定符），<c>const QPointerEvent*</c> 因此退化成 <c>QPointerEvent*</c>。
+    /// 其余场合丢 const 只是少写限定符（实参到只读形参的隐式转换仍然成立），但 lambda 形参
+    /// 必须与信号声明**完全**一致：<c>QObject::connect</c> 的 ComputeFunctorArgumentCount
+    /// 逐前缀试调用，<c>const T*</c> 不能绑定到 <c>T*</c>，参数个数会被判成 0，
+    /// 进而报 qobject.h C2039/C2065 一族错误（QPointingDevice::grabChanged 实测）。
+    /// </remarks>
+    private static string SignalLambdaParameter(CXCursor argument, string cppType)
+    {
+        if (HasConstPointee(argument.Type) is false)
+            return cppType;
+
+        return cppType.StartsWith("const ", StringComparison.Ordinal) ? cppType : "const " + cppType;
+    }
+
+    /// <summary>
+    /// 指向的目标是否带 <c>const</c> 限定。
+    /// </summary>
+    private static bool HasConstPointee(CXType declared)
+    {
+        CXType canonical = Canonical(declared);
+        if (canonical.kind is not CXTypeKind.CXType_Pointer)
+            return false;
+
+        return declared.PointeeType.IsConstQualified || canonical.PointeeType.IsConstQualified;
+    }
+
+    /// <summary>
+    /// 信号形参能否按值传递：记录类型一律按 <c>const</c> 引用传递。
+    /// </summary>
+    /// <remarks>
+    /// 按值接参会先在 lambda 表达式里构造、再在退出时析构该对象；析构不可访问
+    /// （<c>QSessionManager</c> 的析构是 private）或类型不可拷贝时，connect 表达式都无法编译。
+    /// 只判记录会漏掉引用形参：<c>QSessionManager&amp;</c> 的 canonical kind 是引用而不是记录，
+    /// 于是引用参数被按值接参（C2248 实测）。
+    /// 引用既不构造也不析构，对所有记录形态都安全，因此剥掉引用后按记录判定。
     /// </remarks>
     private static bool IsCopyableSignalParameter(CXCursor argument)
     {
-        CXType shape = Canonical(argument.Type);
-        if (shape.kind is not CXTypeKind.CXType_Record)
-            return true;
-
-        CXCursor declaration = shape.Declaration;
-        if (declaration.IsNull)
-            return true;
-
-        CXCursor definition = declaration.Definition;
-        if (definition.IsNull)
-            return true;
-
-        CXCursor destructor = definition.Destructor;
-        if (destructor.IsNull)
-            return true;
-
-        return destructor.CXXAccessSpecifier is CX_CXXAccessSpecifier.CX_CXXInvalidAccessSpecifier
-            or CX_CXXAccessSpecifier.CX_CXXPublic;
+        CXType shape = PeelReference(Canonical(argument.Type));
+        return shape.kind is not CXTypeKind.CXType_Record;
     }
 
     /// <summary>
@@ -399,7 +420,12 @@ public sealed partial class QTShimGenerator(QTShimGeneratorOptions options) : Cp
     /// ② 形参是句柄指针：值实参 <c>reinterpret_cast&lt;T*&gt;(&amp;p)</c>，指针实参 <c>reinterpret_cast&lt;T*&gt;(p)</c>；
     /// ③ 形参是标量：原样传递。
     /// </remarks>
-    private static string SignalArgument(CXCursor argument, ShimParameterInfo parameter, int index)
+    private static string SignalArgument(
+        CXCursor argument,
+        ShimParameterInfo parameter,
+        bool byReference,
+        string cppType,
+        int index)
     {
         string name = "p" + index.ToString(CultureInfo.InvariantCulture);
         string cType = parameter.CType ?? "";
@@ -412,14 +438,25 @@ public sealed partial class QTShimGenerator(QTShimGeneratorOptions options) : Cp
                 : name;
         }
 
-        // 实参已是指针：直接强转为形参类型（不取址，否则指针套指针）
+        // 实参已是指针：直接强转为形参类型（不取址，否则指针套指针）。
+        // 目标带 const 时（lambda 形参必须与信号声明完全一致，不能丢 const）不能直接
+        // 转成 void*/句柄指针：reinterpret_cast 会丢弃限定（C2440），先经 const_cast 去掉
         if (Canonical(argument.Type).kind is CXTypeKind.CXType_Pointer)
-            return "reinterpret_cast<" + cType + ">(" + name + ")";
+        {
+            string value = HasConstPointee(argument.Type)
+                ? "const_cast<void*>(static_cast<const void*>(" + name + "))"
+                : name;
+            return cType is "void*" ? value : "reinterpret_cast<" + cType + ">(" + value + ")";
+        }
 
         // 实参是值：先取址，再强转为形参类型。
         // 取址得到的是 C++ 类型指针（如 QPrivateSignal*），而形参是不透明句柄指针
-        // （cpp_shim_*_QPrivateSignal*）——两者是不同的 struct，缺这一步转换就会报 C2664
-        string address = "&" + name;
+        // （cpp_shim_*_QPrivateSignal*）——两者是不同的 struct，缺这一步转换就会报 C2664。
+        // 引用接参时形参是 const 引用，取址得到的是 const T*，必须先去掉 const 才能转成
+        // 非 const 的句柄指针（reinterpret_cast 不能隐式丢弃 const）
+        string address = byReference
+            ? "const_cast<" + cppType + "*>(&" + name + ")"
+            : "&" + name;
         return cType is "void*" ? address : "reinterpret_cast<" + cType + ">(" + address + ")";
     }
 
@@ -458,10 +495,10 @@ public sealed partial class QTShimGenerator(QTShimGeneratorOptions options) : Cp
         List<string> lambdaArguments)
     {
         bool overloaded = IsOverloaded(signal, signalName);
-        string signalPointer = overloaded
-            ? "static_cast<void (" + type.CppName + "::*)(" + string.Join(", ", lambdaParameters.Select(p => p[..p.LastIndexOf(' ')]))
-                + ")>(&" + type.CppName + "::" + signalName + ")"
-            : "&" + type.CppName + "::" + signalName;
+        string? memberPointerType = overloaded ? MemberPointerType(type, signal) : null;
+        string signalPointer = memberPointerType is null
+            ? "&" + type.CppName + "::" + signalName
+            : "static_cast<" + memberPointerType + ">(&" + type.CppName + "::" + signalName + ")";
 
         using StringWriter writer = CreateWriter();
         // 句柄类型是 shim 自定义的不透明结构体，需要从 Qt 的连接对象强转
@@ -481,6 +518,28 @@ public sealed partial class QTShimGenerator(QTShimGeneratorOptions options) : Cp
         // 闭合 callback(...)、lambda、connect(...)、new Connection 与 reinterpret_cast
         writer.WriteLine("); })));");
         return writer.ToString();
+    }
+
+    /// <summary>
+    /// 重载信号的成员指针类型文本，供 <c>static_cast</c> 消歧。
+    /// </summary>
+    /// <remarks>
+    /// 形参类型必须取自**声明本身**（<c>CXType.Spelling</c> 保留 const 与引用），
+    /// 不能用 lambda 形参反推：lambda 形参为规避析构会把记录类型改成 const 引用，
+    /// 与信号声明的签名不一定一致，<c>static_cast</c> 会因签名不匹配而失败。
+    /// Qt 的信号一律返回 void，非 void 声明不参与消歧。
+    /// </remarks>
+    private static string? MemberPointerType(ShimTypeInfo type, CXCursor signal)
+    {
+        if (Canonical(signal.ResultType).kind is not CXTypeKind.CXType_Void)
+            return null;
+
+        List<string> parts = [];
+        int count = signal.NumArguments;
+        for (int i = 0; i < count; i++)
+            parts.Add(signal.GetArgument((uint)i).Type.Spelling.ToString());
+
+        return "void (" + type.CppName + "::*)(" + string.Join(", ", parts) + ")";
     }
 
     /// <summary>
@@ -828,18 +887,27 @@ public sealed partial class QTShimGenerator(QTShimGeneratorOptions options) : Cp
     /// <summary>
     /// 同名方法是否构成重载，决定信号成员指针是否需要 <c>static_cast</c> 消歧。
     /// </summary>
+    /// <remarks>
+    /// 必须走类定义的 <c>NumMethods</c>/<c>GetMethod</c>：<c>SemanticParent</c> 拿到的是
+    /// 「被引用的类游标」，它的 <c>NumChildren</c> 在跨翻译单元引用时返回 -1
+    /// （QSignalMapper 实测），按子节点遍历永远数不到重载，<c>&amp;Class::map</c> 就保留了
+    /// overloaded-function 形态（C2665）。
+    /// </remarks>
     private static bool IsOverloaded(CXCursor signal, string name)
     {
-        CXCursor parent = signal.SemanticParent;
-        if (parent.IsNull)
+        CXCursor scope = signal.SemanticParent;
+        if (scope.IsNull)
             return false;
 
-        int count = parent.NumChildren;
+        CXCursor definition = scope.Definition;
+        if (definition.IsNull is false)
+            scope = definition;
+
+        int count = scope.NumMethods;
         int matches = 0;
         for (int i = 0; i < count; i++)
         {
-            CXCursor child = parent.GetChild((uint)i);
-            if (child.kind is CXCursorKind.CXCursor_CXXMethod && child.Spelling.ToString() == name)
+            if (scope.GetMethod((uint)i).Spelling.ToString() == name)
                 matches++;
         }
 
