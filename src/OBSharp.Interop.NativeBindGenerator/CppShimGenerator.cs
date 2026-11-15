@@ -1259,7 +1259,7 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
 
         // 路径太浅（盘符根、/usr、/home 之类）说明头文件不在同一棵框架树里，
         // 用它排除系统头会把真正的系统头一起放过，宁可不排除
-        if (common.Count < 2)
+        if (common.Count is < 2)
             return null;
 
         // Windows 的盘符（E:）是路径首段，拼接时不能再加前导斜杠
