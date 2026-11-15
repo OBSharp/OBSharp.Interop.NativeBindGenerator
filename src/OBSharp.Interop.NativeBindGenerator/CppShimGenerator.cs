@@ -1435,6 +1435,27 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
                 => "static_cast<" + cppType + ">(" + name + ")",
             CXTypeKind.CXType_Pointer
                 => "reinterpret_cast<" + cppType + ">(" + name + ")",
+            // 标量形参一律按声明类型显式转换：C 侧用定宽类型（int64_t/uint64_t），
+            // 在 LP64 上与 Qt 的 qlonglong/quint64 不是同一类型，直接传左值会让
+            // 重载集合整体变成 ambiguous（QRandomGenerator::bounded 实测）
+            CXTypeKind.CXType_Bool
+                or CXTypeKind.CXType_Char_S
+                or CXTypeKind.CXType_Char_U
+                or CXTypeKind.CXType_Char16
+                or CXTypeKind.CXType_Char32
+                or CXTypeKind.CXType_SChar
+                or CXTypeKind.CXType_UChar
+                or CXTypeKind.CXType_Short
+                or CXTypeKind.CXType_UShort
+                or CXTypeKind.CXType_Int
+                or CXTypeKind.CXType_UInt
+                or CXTypeKind.CXType_Long
+                or CXTypeKind.CXType_ULong
+                or CXTypeKind.CXType_LongLong
+                or CXTypeKind.CXType_ULongLong
+                or CXTypeKind.CXType_Float
+                or CXTypeKind.CXType_Double
+                => "static_cast<" + cppType + ">(" + name + ")",
             _ => name,
         };
 
