@@ -1295,6 +1295,29 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
             .Any(segment => segment.StartsWith("__", StringComparison.Ordinal));
 
     /// <summary>
+    /// 按值或按引用使用的记录是否以保留标识符命名。
+    /// </summary>
+    /// <remarks>
+    /// <see cref="IsReservedTypeName"/> 只在类型登记阶段过滤顶层声明，管不到形参与返回值：
+    /// aarch64 Linux 的 <c>va_list</c> 会以 <c>std::__va_list</c> 的记录形态出现在 <c>qvsnprintf</c>
+    /// 的形参位，按值接入时 shim 必须把这个名字写进源码，而它在该平台根本不存在可见类型
+    /// （"<c>__va_list</c> in namespace <c>std</c> does not name a type"）。这类记录无法跨 FFI 表达，
+    /// 只能整条导出跳过。
+    /// 指针不参与判断：<c>GLsync</c> 就是 <c>struct __GLsync*</c>，名字虽属保留族但是合法的不透明句柄，
+    /// 指针位不会把记录名写进 shim，按指针过滤会连带砍掉 OpenGL 的全部同步对象导出。
+    /// </remarks>
+    private static bool IsReservedIdentifierRecord(CXType type)
+    {
+        CXType shape = PeelReference(Canonical(type));
+        if (shape.kind is not CXTypeKind.CXType_Record)
+            return false;
+
+        return QualifiedName(shape.Declaration)
+            .Split("::", StringSplitOptions.RemoveEmptyEntries)
+            .Any(segment => segment.StartsWith("__", StringComparison.Ordinal));
+    }
+
+    /// <summary>
     /// 声明前缀（从名字所在行的行首到名字）里是否出现导出宏。
     /// </summary>
     /// <remarks>
@@ -1505,6 +1528,16 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
 
         if (parameters.Any(parameter => parameter.CType is null))
             return;
+
+        // 按值使用的保留名记录不能跨 FFI：aarch64 Linux 上 `va_list` 规范化为 `std::__va_list`，
+        // 它只是内建可变参数列表的实现细节，shim 里写出这个名字根本不存在可见类型
+        // （"`__va_list` in namespace `std` does not name a type"）。判据按名字形态，
+        // 不逐个枚举具体类型：新出现的同类内建记录同样会被拦下
+        if (IsReservedIdentifierRecord(declaration.ResultType)
+            || parameters.Any(parameter => IsReservedIdentifierRecord(parameter.Canonical)))
+        {
+            return;
+        }
 
         // 按值使用的记录类型必须在**本翻译单元内**有完整定义：只前置声明的类型可以合法地作为
         // 不透明句柄（指针）出现，但按值传参/返回都要复制对象，C++ 侧只能报「无法从 X 转换为 X」
