@@ -50,19 +50,21 @@ public sealed class CBindingGeneratorOptions
         ["signed char"] = "global::System.SByte",
         ["signed short"] = "global::System.Int16",
         ["signed int"] = "global::System.Int32",
-        ["signed long"] = "global::System.Runtime.InteropServices.CLong",
         ["signed long long"] = "global::System.Int64",
         // 显式无符号整数类型
         ["unsigned char"] = "global::System.Byte",
         ["unsigned short"] = "global::System.UInt16",
         ["unsigned int"] = "global::System.UInt32",
-        ["unsigned long"] = "global::System.Runtime.InteropServices.CULong",
         ["unsigned long long"] = "global::System.UInt64",
         // 整数类型
         ["short"] = "global::System.Int16",
         ["int"] = "global::System.Int32",
-        ["long"] = "global::System.Runtime.InteropServices.CLong",
         ["long long"] = "global::System.Int64",
+        // C 的 long / unsigned long 宽度随目标平台变化（LLP64 为 4 字节、LP64 为 8 字节），
+        // 不能按名字固定映射：CLong 的底层字段固定是 Int32，在 LP64 上承接不了 8 字节的 long，
+        // 而且它没有任何转换运算符，长度实参的强转 `(CLong)span.Length` 直接无法编译（CS0030）。
+        // 这类宽度相关的整型统一由 MapType 按 CXType.SizeOf 落到定宽类型，与常量映射
+        // （ConstantIntegerValue）的既有口径一致
 
         // 字符类型
         ["char"] = "global::System.Byte", // C 标准 char 类型，通常为有符号 但在 C# 里通常对应为无符号 byte 类型

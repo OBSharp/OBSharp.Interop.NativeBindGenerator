@@ -179,7 +179,7 @@ public sealed class CBindingGenerator(CBindingGeneratorOptions options) : ClangC
                 return MapType(shape.CanonicalType, usage);
 
             default:
-                if (ScalarName(shape.kind) is { } scalar)
+                if (ScalarName(shape) is { } scalar)
                     return new(scalar, [], spelling);
 
                 throw new NotSupportedException($"类型 {spelling} 暂不支持");
@@ -363,8 +363,11 @@ public sealed class CBindingGenerator(CBindingGeneratorOptions options) : ClangC
         }
     }
 
-    private static string? ScalarName(CXTypeKind kind)
-        => kind switch
+    /// <summary>
+    /// 标量类型到 C# 类型的映射；宽度随平台变化的 <c>long</c> / <c>unsigned long</c> 按实际字节数落位。
+    /// </summary>
+    private static string? ScalarName(CXType type)
+        => type.kind switch
         {
             CXTypeKind.CXType_Char_S or CXTypeKind.CXType_Char_U or CXTypeKind.CXType_UChar => "byte",
             CXTypeKind.CXType_SChar => "sbyte",
@@ -374,8 +377,9 @@ public sealed class CBindingGenerator(CBindingGeneratorOptions options) : ClangC
             CXTypeKind.CXType_UShort => "ushort",
             CXTypeKind.CXType_Int => "int",
             CXTypeKind.CXType_UInt => "uint",
-            CXTypeKind.CXType_Long => "CLong",
-            CXTypeKind.CXType_ULong => "CULong",
+            // C 的 long 宽度由目标平台决定：Windows 为 4 字节，Linux/macOS 为 8 字节
+            CXTypeKind.CXType_Long => type.SizeOf is 4 ? "int" : "long",
+            CXTypeKind.CXType_ULong => type.SizeOf is 4 ? "uint" : "ulong",
             CXTypeKind.CXType_LongLong => "long",
             CXTypeKind.CXType_ULongLong => "ulong",
             CXTypeKind.CXType_Float => "float",
