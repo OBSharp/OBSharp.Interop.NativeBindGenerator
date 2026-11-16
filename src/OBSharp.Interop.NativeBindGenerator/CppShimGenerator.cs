@@ -1156,7 +1156,8 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
     }
 
     /// <summary>
-    /// 无宿主前缀的自由函数是否不应成为 C 导出：内联函数、Qt 的 <c>q</c>/<c>qt_</c> 工具函数、CRT 保留名。
+    /// 无宿主前缀的自由函数是否不应成为 C 导出：内联函数、系统/编译器头里的声明、
+    /// Qt 的 <c>q</c>/<c>qt_</c> 工具函数、CRT 保留名。
     /// </summary>
     /// <remarks>
     /// 只针对**没有** <c>--export-prefix</c> 前缀的名字：带前缀的自由函数是调用方用该前缀
@@ -1181,10 +1182,12 @@ public partial class CppShimGenerator(CppShimGeneratorOptions options) : ClangCo
         if (name.StartsWith("__", StringComparison.Ordinal))
             return true;
 
-        // 单下划线 + 来自编译器/SDK 系统头：_stui、_xend、_xbegin、_wbnoinvd 等内建指令函数。
-        // 不按名字逐个枚举（B3 的教训），改为判断声明所在文件是否位于系统头路径——
-        // Qt 头才是一等公民，其余系统头里的自由函数一律不导出
-        return name.StartsWith('_') && IsSystemHeaderDeclaration(declaration);
+        // 声明来自编译器/SDK 系统头的自由函数一律不导出：它们没有面向调用方的稳定 ABI，
+        // 名字也不一定带保留前缀。aarch64 Linux 的 arm_neon.h 就漏出过 vsha1h_u32：
+        // 它是 always_inline 的 intrinsic，`__inline` 写在名字上方一行，按源码行判内联判不出来，
+        // 生成包装后 GCC 直接报「target specific option mismatch」（该 intrinsic 需要 +sha2）。
+        // 判据只看声明所在文件，不按名字枚举；框架头优先，Qt 自己的头文件不受影响
+        return IsSystemHeaderDeclaration(declaration);
     }
 
     /// <summary>
